@@ -3,6 +3,14 @@
 
 struct xal_reflink;
 
+/**
+ * Basename prefix of the per-session reflink shadow directory: <mnt>/.xal_snapshot.<pid>
+ *
+ * Shared with the inotify watcher, which drops events naming a shadow directory so that the
+ * snapshot does not report itself as a change to the filesystem it snapshotted.
+ */
+#define XAL_SNAPSHOT_PREFIX ".xal_snapshot."
+
 struct xal_be_fiemap {
 	struct xal_backend_base base;
 	char *mountpoint;      ///< Path to mountpoint of dev

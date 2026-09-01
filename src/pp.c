@@ -385,12 +385,8 @@ xal_inotify_pp(struct xal_inotify *inotify)
 			wrtn += printf("  watchmode: XAL_WATCHMODE_NONE\n");
 			break;
 
-		case XAL_WATCHMODE_DIRTY_DETECTION:
-			wrtn += printf("  watchmode: XAL_WATCHMODE_DIRTY_DETECTION\n");
-			break;
-
-		case XAL_WATCHMODE_EXTENT_UPDATE:
-			wrtn += printf("  watchmode: XAL_WATCHMODE_EXTENT_UPDATE\n");
+		case XAL_WATCHMODE_REFLINK_SNAPSHOT:
+			wrtn += printf("  watchmode: XAL_WATCHMODE_REFLINK_SNAPSHOT\n");
 			break;
 
 		default:

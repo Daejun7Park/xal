@@ -58,33 +58,29 @@ integration and supports path-based inode and extent lookup via `xal_get_inode()
 
 #### File system changes
 
-Using inotify, **xal** monitors changes to the indexed files if a fitting
-watchmode is set.
-
 **`XAL_WATCHMODE_NONE`**
-: No inotify setup. The xal struct will never be marked dirty automatically.
+: Nothing is watched and nothing is pinned. The extents describe the filesystem
+  as it was at `xal_index()` time, and a write by any other process can
+  invalidate them. For a caller that owns the filesystem; `xal_mark_dirty()` is
+  available to signal a change the caller made itself.
 
-**`XAL_WATCHMODE_DIRTY_DETECTION`**
-: Any filesystem event marks the xal struct as dirty. The caller detects
-  this with `xal_is_dirty()` and must re-call `xal_index()` to rebuild
-  the tree.
+**`XAL_WATCHMODE_REFLINK_SNAPSHOT`**
+: Every regular file, optionally restricted to `opts.subtree`, is
+  reflink-cloned into a private immutable shadow directory at `xal_index()`
+  time, and the extents are captured from the clones. The clones hold the
+  blocks for as long as the index that produced them stands, so no foreign
+  write can move a block out from under a published extent. A re-index
+  re-snapshots and releases them; clones are removed at `xal_close()`.
 
-**`XAL_WATCHMODE_EXTENT_UPDATE`**
-: File-modification events (`IN_MODIFY`, `IN_CLOSE_WRITE`) trigger an
-  automatic in-place extent refresh for the affected file via a new FIEMAP
-  call, coordinated with `seq_lock` so concurrent readers remain safe.
-  Structural changes (`IN_CREATE`, `IN_DELETE`, `IN_MOVE`) still mark
-  the struct dirty, as they require a full re-index.
+: An inotify watch runs alongside the clones, at whole-index granularity. The
+  dirty flag means something different here than for a mode with nothing
+  pinned: `xal_is_dirty()` becoming true says *the filesystem has moved on*,
+  not *your extents may be garbage*. See `enum xal_watchmode` in `libxal.h`
+  for what the pinning does and does not guarantee, and `xal_get_extents()`
+  for the sequence-lock loop a reader owes it.
 
-Either mode ignores events on entries the index skips: symlinks, special
-files and mount points.
-
-When opened with a `watch_mode` other than `XAL_WATCHMODE_NONE`, an
-inotify watch is registered for every directory during `xal_index()`.
-A background thread started with `xal_watch_filesystem()` then processes
-events. The watched event mask per directory is: `IN_CREATE`,
-`IN_DELETE`, `IN_MOVE`, `IN_MODIFY`, `IN_ATTRIB`,
-`IN_CLOSE_WRITE`, and `IN_UNMOUNT`.
+While the index is clean, the watch ignores events on entries the index skips:
+symlinks, special files and mount points.
 
 #### File lookup modes
 

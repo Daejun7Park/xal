@@ -24,9 +24,6 @@
 
 KHASH_MAP_INIT_STR(path_to_inode, struct xal_inode *)
 
-/** Basename prefix of the per-session reflink shadow directory: <mnt>/.xal_snapshot.<pid> */
-#define XAL_SNAPSHOT_PREFIX ".xal_snapshot."
-
 /** Max length of a "<dir>/<entry>" path assembled under the shadow directory. */
 #define XAL_SNAPSHOT_ENTRY_MAXLEN (XAL_PATH_MAXLEN + 64)
 
@@ -94,11 +91,10 @@ path_map_destroy(khash_t(path_to_inode) *map)
 /**
  * Reflink-snapshot state (XAL_WATCHMODE_REFLINK_SNAPSHOT).
  *
- * At index time every regular file the walk visits is reflink-cloned into a private shadow
- * directory (the walk is scoped by be->subtree, so the subtree restriction is applied there, not
- * here). The clone's on-disk inode keeps the shared blocks allocated for the whole xal session --
- * so the extents captured from it stay valid even as the origin is rewritten (writes to the origin
- * divert to new blocks via CoW). The clones are removed at xal_close().
+ * Every regular file the walk visits is cloned into a private shadow directory; the clone's inode
+ * keeps the shared blocks allocated, so extents captured from it survive writes to the origin
+ * (which divert via CoW). Clones live until the next xal_index() or xal_close(), whichever comes
+ * first. See enum xal_watchmode for what that guarantees a reader.
  */
 struct xal_reflink {
 	char *dir;        ///< Shadow directory holding the clones: <mountpoint>/.xal_snapshot.<pid>
@@ -242,15 +238,12 @@ reflink_dir_prepare(struct xal_reflink *rl)
 /**
  * Reflink-clone the file open at @origin_fd into the shadow directory.
  *
- * FICLONE itself flushes the origin's dirty pages (write-and-wait under the iolock) and resolves
- * delayed allocation to real blocks before sharing, so no explicit fsync is needed for the clone's
- * FIEMAP to see true physical extents. The clone is left on-disk (its inode pins the shared
- * blocks); the fd returned in @clone_fd is only needed to FIEMAP the clone and may be closed
- * afterwards without freeing blocks.
+ * FICLONE write-and-waits the origin under the iolock and resolves delalloc to real blocks before
+ * sharing, so no explicit fsync is needed for the clone's FIEMAP to see true physical extents.
+ * The clone is left on-disk (its inode pins the blocks); @clone_fd is only needed to FIEMAP it.
  *
- * One clone per inode instance: a hardlink to the same inode reuses the existing clone rather
- * than cloning the same data again. Clones are named "<ino>.<gen>" so a recycled inode number
- * (a different instance) never collides with an earlier one.
+ * One clone per inode instance, named "<ino>.<gen>": a hardlink reuses the existing clone, and the
+ * generation keeps a recycled inode number from colliding with an earlier instance.
  */
 static int
 reflink_clone_file(struct xal_be_fiemap *be, const char *path, int origin_fd, int *clone_fd)
@@ -359,14 +352,27 @@ xal_be_fiemap_close(struct xal *xal)
 
 	if (xal->procrole == XAL_PROCROLE_SECONDARY) {
 		XAL_DEBUG("INFO: secondary; watcher and snapshot belong to the primary");
-	} else if (be->inotify) {
-		xal_be_fiemap_inotify_close(be->inotify);
-	} else if (be->reflink) {
-		if (be->reflink->dir_created) {
-			reflink_dir_purge(be->reflink->dir);
+	} else {
+		// The watch thread is joined first: purging the clones unlinks paths the mountpoint
+		// watch reports on.
+		if (be->inotify) {
+			xal_be_fiemap_inotify_close(be->inotify);
+			free(be->inotify);
+			be->inotify = NULL;
 		}
-		free(be->reflink->dir);
-		free(be->reflink);
+		// A callback can have re-indexed since xal_close() marked the index dirty; a secondary
+		// attaching now must not get a handle on clones about to be purged.
+		if (xal->state) {
+			xal_mark_dirty(xal);
+		}
+		if (be->reflink) {
+			if (be->reflink->dir_created) {
+				reflink_dir_purge(be->reflink->dir);
+			}
+			free(be->reflink->dir);
+			free(be->reflink);
+			be->reflink = NULL;
+		}
 	}
 
 	free(be->mountpoint);
@@ -539,6 +545,13 @@ xal_be_fiemap_open(struct xal **xal, char *mountpoint, struct xal_opts *opts)
 		return -EINVAL;
 	}
 
+	// Accept only known modes: anything unrecognised must not fall through to the watch setup
+	// below and be treated as "some mode".
+	if ((opts->watch_mode != XAL_WATCHMODE_NONE) &&
+	    (opts->watch_mode != XAL_WATCHMODE_REFLINK_SNAPSHOT)) {
+		XAL_DEBUG("FAILED: watch_mode(%d) is not a valid xal_watchmode", opts->watch_mode);
+		return -EINVAL;
+	}
 
 	cand = calloc(1, sizeof(*cand));
 	if (!cand) {
@@ -611,7 +624,8 @@ xal_be_fiemap_open(struct xal **xal, char *mountpoint, struct xal_opts *opts)
 	}
 
 	if (opts->watch_mode == XAL_WATCHMODE_REFLINK_SNAPSHOT) {
-		// reflink-snapshot mode: no inotify watch; clones pin the blocks
+		// The clones pin the blocks; the watch below only reports that the filesystem has
+		// moved on since.
 		size_t dlen;
 
 		be->reflink = calloc(1, sizeof(struct xal_reflink));
@@ -637,7 +651,9 @@ xal_be_fiemap_open(struct xal **xal, char *mountpoint, struct xal_opts *opts)
 
 		XAL_DEBUG("INFO: reflink-snapshot mode; clones under dir(%s), subtree(%s)",
 			  be->reflink->dir, be->subtree ? be->subtree : "(whole tree)");
-	} else if (opts->watch_mode) {
+	}
+
+	if (opts->watch_mode) {
 		be->inotify = calloc(1, sizeof(struct xal_inotify));
 		if (!be->inotify) {
 			XAL_DEBUG("FAILED: calloc(); errno(%d)", errno);
@@ -868,12 +884,8 @@ exit:
 }
 
 /*
- * Take a pointer to a fiemap struct with an fm_extents array of size 0.
- * The ioctl sets the "mapped_extents" integer to the amount of extents
- * existing in the file descriptor, so we reallocate the fiemap to be of
- * the right size, and then run the ioctl again with "fm_extent_count"
- * set to the right size too, such that all the extents are read into the
- * struct.
+ * Two ioctls: the first, with fm_extent_count 0, reports how many extents the file has; the
+ * fiemap is then reallocated to fit and the ioctl re-run to read them.
  */
 static int
 read_fiemap(int fd, struct fiemap **fiemap_ptr)
@@ -916,7 +928,7 @@ read_fiemap(int fd, struct fiemap **fiemap_ptr)
 	return 0;
 }
 
-int
+static int
 xal_be_fiemap_process_inode_file(struct xal *xal, char *path, struct xal_inode *inode)
 {
 	struct xal_be_fiemap *be = (struct xal_be_fiemap *)&xal->be;
@@ -946,8 +958,9 @@ xal_be_fiemap_process_inode_file(struct xal *xal, char *path, struct xal_inode *
 		goto failed;
 	}
 
-	// In reflink-snapshot mode, capture extents from a reflink clone (whose blocks are pinned
-	// for the session) instead of the live origin, so they stay valid under concurrent writes.
+	// In reflink-snapshot mode, capture extents from a reflink clone (whose blocks stay pinned
+	// until the next xal_index() or xal_close()) instead of the live origin, so they stay valid
+	// under concurrent writes.
 	map_fd = fd;
 	if (be->reflink) {
 		err = reflink_clone_file(be, path, fd, &clone_fd);
