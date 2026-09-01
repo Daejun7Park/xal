@@ -16,14 +16,11 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
-#include <sys/sysmacros.h>
 #include <unistd.h>
 #include <xal.h>
 #include <xal_be_fiemap.h>
 #include <xal_be_fiemap_inotify.h>
 #include <xal_odf.h>
-#include <xal_bpf_events.h>
-#include <xal_bpf.h>
 
 KHASH_MAP_INIT_STR(path_to_inode, struct xal_inode *)
 
@@ -361,7 +358,7 @@ xal_be_fiemap_close(struct xal *xal)
 	be = (struct xal_be_fiemap *)&xal->be;
 
 	if (xal->procrole == XAL_PROCROLE_SECONDARY) {
-		XAL_DEBUG("INFO: secondary; watcher, snapshot and freeze belong to the primary");
+		XAL_DEBUG("INFO: secondary; watcher and snapshot belong to the primary");
 	} else if (be->inotify) {
 		xal_be_fiemap_inotify_close(be->inotify);
 	} else if (be->reflink) {
@@ -370,28 +367,6 @@ xal_be_fiemap_close(struct xal *xal)
 		}
 		free(be->reflink->dir);
 		free(be->reflink);
-	} else {
-#ifdef XAL_BPF_ENABLED
-		if (be->bpf) {
-			xal_be_fiemap_bpf_close(be->bpf);
-		}
-#endif /* XAL_BPF_ENABLED */
-
-		int fd = open(be->mountpoint, O_RDONLY | O_DIRECTORY);
-
-		if (fd >= 0) {
-			int err = ioctl(fd, FITHAW, 0);
-			if (err == 0) {
-				XAL_DEBUG("INFO: thawed filesystem");
-			} else if (errno == EINVAL) {
-				XAL_DEBUG("INFO: FITHAW returned EINVAL; already thawed?");
-			} else {
-				XAL_DEBUG("ERROR: could not thaw filesystem; errno(%d)", errno);
-			}
-			close(fd);
-		} else {
-			XAL_DEBUG("FAILED: could not open() fs mountpoint for thaw");
-		}
 	}
 
 	free(be->mountpoint);
@@ -564,6 +539,7 @@ xal_be_fiemap_open(struct xal **xal, char *mountpoint, struct xal_opts *opts)
 		return -EINVAL;
 	}
 
+
 	cand = calloc(1, sizeof(*cand));
 	if (!cand) {
 		XAL_DEBUG("FAILED: calloc(); errno(%d)", errno);
@@ -635,7 +611,7 @@ xal_be_fiemap_open(struct xal **xal, char *mountpoint, struct xal_opts *opts)
 	}
 
 	if (opts->watch_mode == XAL_WATCHMODE_REFLINK_SNAPSHOT) {
-		// reflink-snapshot mode: no inotify watch, no freeze; clones pin the blocks
+		// reflink-snapshot mode: no inotify watch; clones pin the blocks
 		size_t dlen;
 
 		be->reflink = calloc(1, sizeof(struct xal_reflink));
@@ -674,68 +650,6 @@ xal_be_fiemap_open(struct xal **xal, char *mountpoint, struct xal_opts *opts)
 			XAL_DEBUG("FAILED: xal_be_fiemap_inotify_init()");
 			goto failed;
 		}
-	} else {
-#ifdef XAL_BPF_ENABLED
-		// since fs is mounted without a watch mode, freeze it
-		// + init bpf thread to listen to unfreeze events
-		struct xal_bpf *bpf = calloc(1, sizeof(struct xal_bpf));
-		if (!bpf) {
-			XAL_DEBUG("FAILED: calloc(); errno(%d)", errno);
-			err = -errno;
-			goto failed;
-		}
-
-		// glibc major()/minor() and the kernel's MKDEV(20,12) split on s_dev
-		// produce the same numeric values, so userspace and BPF can compare
-		// directly. If a kernel changes that split, the BPF filter will start
-		// dropping every event as "ignored" -- check skel->bss->stats.ignored_events.
-		bpf->ctx.dev_major = major(sb.st_dev);
-		bpf->ctx.dev_minor = minor(sb.st_dev);
-		bpf->ctx.fs_block_size = sb.st_blksize;
-
-		err = xal_be_fiemap_bpf_init(bpf);
-		if (err) {
-			XAL_DEBUG("FAILED: xal_be_fiemap_bpf_init()");
-			goto failed;
-		}
-
-		be->bpf = bpf;
-#endif /* XAL_BPF_ENABLED */
-
-		int fd = open(be->mountpoint, O_RDONLY | O_DIRECTORY);
-
-		if (fd < 0) {
-			XAL_DEBUG("FAILED: open(); errno(%d)", errno);
-			err = -errno;
-			goto failed;
-		}
-
-		// when ioctl returns, fs is fully frozen
-		err = ioctl(fd, FIFREEZE, 0);
-		if (err == 0) {
-			XAL_DEBUG("INFO: froze filesystem");
-		} else if (errno == EBUSY) {
-			XAL_DEBUG("INFO: FIFREEZE returned EBUSY; already frozen?");
-		} else {
-			close(fd);
-			XAL_DEBUG("FAILED: could not freeze filesystem; errno(%d)", errno);
-			goto failed;
-		}
-		close(fd);
-
-#ifdef XAL_BPF_ENABLED
-		err = xal_be_fiemap_bpf_rb_init(cand, be->bpf);
-		if (err) {
-			XAL_DEBUG("FAILED: xal_be_fiemap_bpf_rb_init(); err(%d)", err);
-			goto failed;
-		}
-
-		err = xal_bpf_start_poll_thread(cand);
-		if (err) {
-			XAL_DEBUG("FAILED: xal_bpf_start_poll_thread(); err(%d)", err);
-			goto failed;
-		}
-#endif /* XAL_BPF_ENABLED */
 	}
 
 	// Scope the pre-count to the subtree when set: the index walks only that subtree

@@ -45,10 +45,10 @@ enum xal_backend {
 };
 
 enum xal_watchmode {
-	XAL_WATCHMODE_NONE             = 0,  ///< There will be no notifications of changes to the filesystem.
+	XAL_WATCHMODE_NONE             = 0,  ///< Nothing is watched and nothing is pinned: the extents are a snapshot of the filesystem as it was at xal_index() time, and a foreign write can invalidate them at any point. For a caller that owns the filesystem; see xal_mark_dirty() to signal a change made by the caller itself.
 	XAL_WATCHMODE_DIRTY_DETECTION  = 1,  ///< When changes to the file system occurs, the xal struct will become "dirty" indicating that the representation of the file system is stale.
 	XAL_WATCHMODE_EXTENT_UPDATE    = 2,  ///< When other changes to the file system occurs, the xal struct will be automatically updated if the extent information is the only subject to change, otherwise the xal struct will become "dirty" indicating that the representation of the file system is stale.
-	XAL_WATCHMODE_REFLINK_SNAPSHOT = 3,  ///< At xal_index() time, reflink every regular file (optionally restricted to opts.subtree) into a private snapshot and capture extents from the clones. The clones pin their blocks for the xal session, so the extents returned by xal_get_extents() stay valid under concurrent writes. No inotify watch or filesystem freeze is used; clones are removed at xal_close().
+	XAL_WATCHMODE_REFLINK_SNAPSHOT = 3,  ///< At xal_index() time, reflink every regular file (optionally restricted to opts.subtree) into a private snapshot and capture extents from the clones. The clones pin their blocks for the xal session, so the extents returned by xal_get_extents() stay valid under concurrent writes. No inotify watch is used; clones are removed at xal_close().
 };
 
 enum xal_file_lookupmode {
@@ -555,47 +555,5 @@ xal_get_extents(struct xal *xal, char *path, struct xal_extents **extents);
 int
 xal_get_dentries(struct xal *xal, char *path, struct xal_dentries **dentries);
 
-#ifdef XAL_BPF_ENABLED
-/**
- * Start a background thread polling the BPF ring buffer for filesystem events
- * (e.g. unfreeze) on the block device.
- *
- * Assumes that
- *  - you have run xal_open() with backend FIEMAP and BPF event listening enabled,
- *  - the BPF skeleton and ring buffer have been initialized.
- *
- * If the thread is already running, this is a no-op and 0 is returned.
- *
- * @param xal The xal struct obtained when opened with xal_open().
- *
- * @returns On success, 0 is returned. On error, a negative errno is returned to indicate the
- *          error: -EINVAL if xal is NULL; -ENOTSUP if the backend is not FIEMAP; -ENODEV if xal
- *          was not opened with BPF event listening; -ENOTCONN if the BPF skeleton is not
- *          initialized; -ENOBUFS if the ring buffer is not initialized; or the negated errno
- *          from pthread_create() if thread creation fails.
- */
-int
-xal_bpf_start_poll_thread(struct xal *xal);
-
-/**
- * Stop the background thread polling the BPF ring buffer.
- *
- * Assumes that
- *  - you have run xal_open() with backend FIEMAP and BPF event listening enabled,
- *  - the background thread is running, see xal_bpf_start_poll_thread().
- *
- * If these assumptions do not hold, this will result in an error.
- *
- * @param xal The xal struct obtained when opened with xal_open().
- *
- * @returns On success, 0 is returned. On error, a negative errno is returned to indicate the
- *          error: -EINVAL if xal is NULL; -ENOTSUP if the backend is not FIEMAP; -ENODEV if xal
- *          was not opened with BPF event listening; -ENOTCONN if the BPF skeleton is not
- *          initialized; -ESRCH if the background thread is not running; or the negated errno
- *          from pthread_join() if joining the thread fails.
- */
-int
-xal_bpf_stop_poll_thread(struct xal *xal);
-#endif /* XAL_BPF_ENABLED */
 
 #endif /* LIBXAL_H */
