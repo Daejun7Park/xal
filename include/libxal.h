@@ -143,9 +143,22 @@ struct xal_sb {
 	uint32_t lba_blksze;   ///< LBA block size
 };
 
+/**
+ * Resolve a pool index to the element it names, or NULL when it names nothing
+ *
+ * NULL means the index is outside the pool. For a reader attached to a published index that
+ * means xal_index() rewrote the pools underneath it, so the index it read was never valid.
+ * Treat NULL as the signal to re-read under the sequence lock (see xal_get_extents()), not as
+ * an error about the file. It is bounds-checked rather than left to fault because a fault
+ * never reaches the sequence comparison that would have told the reader to retry.
+ *
+ * The check covers one element. Check every element of a {idx, count} span, not just the
+ * base: idx and count are read separately, so either can be stale.
+ */
 struct xal_inode *
 xal_inode_at(struct xal *xal, uint32_t idx);
 
+/** @see xal_inode_at() */
 struct xal_extent *
 xal_extent_at(struct xal *xal, uint32_t idx);
 
@@ -324,6 +337,12 @@ xal_dinodes_retrieve(struct xal *xal);
  * xal_get_extents() find out; a reader that cached block addresses outside that protocol has no
  * way to.
  *
+ * Takes exactly one caller at a time. A second concurrent call on the same handle returns
+ * -EBUSY rather than interleaving, and the watch callback installed by xal_watch_filesystem()
+ * counts as a caller: a caller that re-indexes from its own thread as well should expect one of
+ * the two to be refused. Interleaved indexes are not merely wasteful -- they can produce extents
+ * that were never a file's, from a call that reports success.
+ *
  * This function will fail if given a xal handle obtained from xal_from_shm().
  *
  * @returns On success, 0 is returned. On error, negative errno is returned to indicate the error.
@@ -337,6 +356,10 @@ xal_index(struct xal *xal);
  *
  * The callback is called from the watch thread; keep it short and thread-safe. It must not call
  * xal_watch_filesystem(), xal_stop_watching_filesystem() or xal_close().
+ *
+ * A callback that calls xal_index() is a caller of it like any other, so a program that also
+ * re-indexes from another thread has two, and xal_index() refuses the second with -EBUSY. Pick
+ * one place to re-index.
  *
  * @param xal     The xal struct that became dirty.
  * @param cb_args The opaque pointer passed to xal_watch_filesystem().

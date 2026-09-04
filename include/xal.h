@@ -76,6 +76,12 @@ struct xal {
 	struct xal_shared_state *state; ///< Mapped shared state region; non-NULL when shm_name was set
 	char *state_shm_name;           ///< Name of the _state shm region; set by primary only, for unlink on close
 	enum xal_procrole procrole;
+
+	/* Held for the duration of xal_index(); a second caller is refused with -EBUSY. Separate
+	 * from index_state because xal_mark_dirty() clears XAL_STATE_INDEXING unconditionally, so
+	 * that state cannot also be the thing that excludes an index. Not shared: a secondary
+	 * cannot index. */
+	atomic_bool indexing;
 };
 
 int

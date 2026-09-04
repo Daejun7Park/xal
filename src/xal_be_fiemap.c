@@ -1216,7 +1216,13 @@ build_hashmap_walk(struct xal *xal, struct xal_inode *inode, char *path, size_t 
 
 	if (xal_inode_is_dir(inode)) {
 		for (uint32_t i = 0; i < inode->content.dentries.count; i++) {
-			struct xal_inode *child = xal_inode_at(xal, inode->content.dentries.inodes_idx + i);
+			struct xal_inode *child =
+				xal_inode_at(xal, inode->content.dentries.inodes_idx + i);
+
+			if (!child) {
+				XAL_DEBUG("FAILED: dentry index out of range");
+				return -ESTALE;
+			}
 
 			/* One buffer for the whole walk; the key is copied before recursing */
 			err = build_hashmap_walk(xal, child, path, path_nbytes);
@@ -1234,6 +1240,7 @@ xal_build_lookup_hashmap(struct xal *xal)
 {
 	struct xal_be_fiemap *be;
 	char path[XAL_INODE_PATH_MAXLEN + 1];
+	struct xal_inode *root;
 	int err;
 
 	if (!xal) {
@@ -1252,6 +1259,12 @@ xal_build_lookup_hashmap(struct xal *xal)
 		return -ESTALE;
 	}
 
+	root = xal_inode_at(xal, xal->root_idx);
+	if (!root) {
+		XAL_DEBUG("FAILED: root index out of range; index rewritten under us");
+		return -ESTALE;
+	}
+
 	path_map_destroy(be->path_inode_map);
 	be->path_inode_map = NULL;
 
@@ -1261,7 +1274,7 @@ xal_build_lookup_hashmap(struct xal *xal)
 		return -ENOMEM;
 	}
 
-	err = build_hashmap_walk(xal, xal_inode_at(xal, xal->root_idx), path, sizeof(path));
+	err = build_hashmap_walk(xal, root, path, sizeof(path));
 	if (err) {
 		XAL_DEBUG("FAILED: build_hashmap_walk(); err(%d)", err);
 		path_map_destroy(be->path_inode_map);
@@ -1310,8 +1323,14 @@ xal_be_fiemap_get_inode(struct xal *xal, char *path, struct xal_inode **inode)
 		// Match the basepath to the indexed tree root: when a subtree is set the walk is rerooted
 		// at it, so strip the subtree prefix (not the mountpoint) from the query.
 		char *basepath = be->subtree ? be->subtree : be->mountpoint;
+		struct xal_inode *root;
 
-		err = search_by_traversal(xal, xal_inode_at(xal, xal->root_idx), path, basepath, inode);
+		root = xal_inode_at(xal, xal->root_idx);
+		if (!root) {
+			XAL_DEBUG("FAILED: root index out of range; index rewritten under us");
+			return -ESTALE;
+		}
+		err = search_by_traversal(xal, root, path, basepath, inode);
 		if (err) {
 			XAL_DEBUG("FAILED: search_by_traversal(%s); err(%d)", path, err);
 			return err;

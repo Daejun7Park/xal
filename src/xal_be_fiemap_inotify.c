@@ -214,13 +214,15 @@ inotify_event_mask_pp(uint32_t mask, char *str, int str_sz) {
 /*
  * Find the indexed entry an event names, and assemble its path into @path from the directory the
  * event's watch is on. Sets @inode to NULL when that directory holds no such entry. Returns -ENOENT
- * when the watch is not one of ours, or the error from assembling the path.
+ * when the watch is not one of ours, -ESTALE when the directory's span is out of range, or the error
+ * from assembling the path.
  */
 static int
 event_entry(struct xal *xal, struct xal_inotify *inotify, struct inotify_event *event,
 	    struct xal_inode **inode, char *path, size_t path_nbytes)
 {
 	kh_wd_to_inode_t *inode_map = inotify->inode_map;
+	uint32_t span_idx, span_count;
 	struct xal_inode *dir;
 	size_t namelen;
 	khiter_t iter;
@@ -253,8 +255,18 @@ event_entry(struct xal *xal, struct xal_inotify *inotify, struct inotify_event *
 	path[dirlen] = '/';
 	memcpy(path + dirlen + 1, event->name, namelen + 1);
 
-	*inode = bsearch(event->name, xal_inode_at(xal, dir->content.dentries.inodes_idx),
-			 dir->content.dentries.count, sizeof(**inode), compare_name_to_inode);
+	/* bsearch() reads the whole span, so check both ends are in range. */
+	span_idx = dir->content.dentries.inodes_idx;
+	span_count = dir->content.dentries.count;
+	if (span_count && ((span_count > xal->inodes.allocated) ||
+			   (span_idx > xal->inodes.allocated - span_count))) {
+		XAL_DEBUG("FAILED: dentry span out of range");
+		return -ESTALE;
+	}
+
+	*inode = span_count ? bsearch(event->name, xal_inode_at(xal, span_idx), span_count,
+				      sizeof(**inode), compare_name_to_inode)
+			    : NULL;
 
 	return 0;
 }
