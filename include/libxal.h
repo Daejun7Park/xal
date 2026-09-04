@@ -45,8 +45,37 @@ enum xal_backend {
 };
 
 enum xal_watchmode {
-	XAL_WATCHMODE_NONE             = 0,  ///< Nothing is watched and nothing is pinned: the extents are a snapshot of the filesystem as it was at xal_index() time, and a foreign write can invalidate them at any point. For a caller that owns the filesystem; see xal_mark_dirty() to signal a change made by the caller itself.
-	XAL_WATCHMODE_REFLINK_SNAPSHOT = 1,  ///< At xal_index() time, reflink every regular file (optionally restricted to opts.subtree) into a private snapshot and capture extents from the clones. The clones pin their blocks for as long as the index that produced them stands, so no foreign write can move a block out from under a published extent. What the pinning buys is not that extents never change but that only xal_index() can change them: a foreign write is undetectable in time, a re-snapshot is an event this library controls and reports by advancing the sequence lock. See xal_get_extents() for what a reader owes that contract, and xal_index() for what a re-snapshot does to the previous one. An inotify watch runs alongside: xal_is_dirty() becoming true means the filesystem has moved on, not that anything in hand went bad. Clones are removed at xal_close(). At most one handle per mount may use this mode: each removes every .xal_snapshot.* under the mountpoint, another handle's clones included.
+	/**
+	 * Nothing is watched and nothing is pinned.
+	 *
+	 * The extents are a snapshot of the filesystem as it was at xal_index() time, and a
+	 * foreign write can invalidate them at any point. For a caller that owns the filesystem;
+	 * see xal_mark_dirty() to signal a change made by the caller itself.
+	 */
+	XAL_WATCHMODE_NONE = 0,
+
+	/**
+	 * Reflink every regular file into a private snapshot at xal_index() time (optionally
+	 * restricted to opts.subtree) and capture extents from the clones, so no foreign write
+	 * can move a block out from under a published extent.
+	 *
+	 * The pinning does not mean extents never change; it means only xal_index() can change
+	 * them. A foreign write is undetectable in time; a re-snapshot is an event this library
+	 * controls and reports by advancing the sequence lock. See xal_get_extents() for the
+	 * reader protocol that depends on it, and xal_index() for what a re-snapshot does to the
+	 * previous one.
+	 *
+	 * Reserves a name: entries called ".xal_snapshot.*" are excluded from the index at every
+	 * depth, since that is where the clones live, so a file or directory of that name is
+	 * invisible to xal_get_inode() and xal_get_extents(). Clones are removed at xal_close().
+	 *
+	 * At most one handle per mount may use this mode: each removes every ".xal_snapshot.*"
+	 * under the mountpoint, another handle's clones included.
+	 *
+	 * An inotify watch runs alongside; xal_is_dirty() becoming true then means the filesystem
+	 * has moved on, not that anything in hand went bad.
+	 */
+	XAL_WATCHMODE_REFLINK_SNAPSHOT = 1,
 };
 
 enum xal_file_lookupmode {
@@ -360,6 +389,11 @@ xal_index(struct xal *xal);
  * A callback that calls xal_index() is a caller of it like any other, so a program that also
  * re-indexes from another thread has two, and xal_index() refuses the second with -EBUSY. Pick
  * one place to re-index.
+ *
+ * xal_index() arms one inotify watch per directory for any watch mode other than
+ * XAL_WATCHMODE_NONE, whether or not xal_watch_filesystem() is ever called. Those watches come
+ * out of fs.inotify.max_user_watches, a per-UID budget shared with every other process, and a
+ * tree with more directories than the budget has left fails to index with -ENOSPC.
  *
  * @param xal     The xal struct that became dirty.
  * @param cb_args The opaque pointer passed to xal_watch_filesystem().

@@ -149,5 +149,5 @@ the reader's buffer. On a mount the reader already has read access to, that is a
 problem solved by discarding and retrying -- treat it as an isolation problem only if the reader
 is not trusted with the rest of the filesystem.
 
-If re-indexing fails, the server logs `the index is stale, restart required` at CRITICAL and the
-index stays dirty. It does not recover on its own.
+If re-indexing fails, the server logs it at ERROR and the index stays dirty; the next change the
+watch sees triggers another attempt.

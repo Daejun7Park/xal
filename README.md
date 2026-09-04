@@ -82,6 +82,33 @@ integration and supports path-based inode and extent lookup via `xal_get_inode()
 While the index is clean, the watch ignores events on entries the index skips:
 symlinks, special files and mount points.
 
+##### What the watch can and cannot see
+
+The watch is one inotify watch per directory, placed during the index walk,
+with the mask `IN_CREATE | IN_DELETE | IN_MOVE | IN_MODIFY | IN_ATTRIB |
+IN_CLOSE_WRITE | IN_MOVE_SELF | IN_DELETE_SELF | IN_UNMOUNT`. One watch per
+directory means a large tree needs a correspondingly large
+`fs.inotify.max_user_watches` -- it is a per-UID budget shared with every other
+inotify user on the system, and a watch that cannot be placed fails the index.
+
+The walk places them whether or not `xal_watch_filesystem()` is ever called, so
+a caller that wants only the pinned extents pays the same budget as one that
+wants the dirty flag, and can be refused an index over a signal it never reads.
+Size `fs.inotify.max_user_watches` for the tree even when nothing will watch it.
+
+Two changes are invisible to it, and no mask fixes either:
+
+- **A writer holding a mapping.** `mmap()` writes produce no event until
+  `munmap()` or the last close, so a long-lived mapped writer is unreported for
+  as long as it holds the mapping.
+- **A hardlink written through a path outside the indexed tree.** inotify
+  reports to the watch on the parent directory used for the operation, so a
+  write through a second link elsewhere notifies that directory, not ours.
+
+Neither can make an extent invalid -- the clone still pins the blocks -- so the
+cost is staleness that goes unreported, not a bad read. Both would be covered
+by a filesystem-wide `fanotify` mark, which needs `CAP_SYS_ADMIN`.
+
 #### File lookup modes
 
 The path-based inode and extent lookup implementation depends on which

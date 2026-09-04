@@ -66,8 +66,10 @@ xal_be_fiemap_inotify_close(struct xal_inotify *inotify)
 		kh_destroy(wd_to_inode, inode_map);
 	}
 
-	if (inotify->fd) {
+	/* fd 0 is a valid descriptor, so -1 is what means "none". */
+	if (inotify->fd >= 0) {
 		close(inotify->fd);
+		inotify->fd = -1;
 	}
 }
 
@@ -82,6 +84,9 @@ xal_be_fiemap_inotify_init(struct xal_inotify *inotify, enum xal_watchmode watch
 	inotify->watch_mode = watch_mode;
 	atomic_init(&inotify->flag, 0);
 	atomic_init(&inotify->stop, false);
+
+	/* calloc() leaves this 0, which names stdin rather than nothing. */
+	inotify->fd = -1;
 
 	if (!inotify->watch_mode) {
 		XAL_DEBUG("INFO: Skipping xal_be_fiemap_inotify_init(), watch mode none given");
@@ -133,6 +138,19 @@ xal_be_fiemap_inotify_clear_inode_map(struct xal_inotify *inotify)
 
 	inode_map = inotify->inode_map;
 
+	/* Drop the kernel watches, not just the map entries: this stops a departed directory
+	 * from reporting, and from leaking its fs.inotify.max_user_watches slot. */
+	for (khiter_t k = kh_begin(inode_map); k != kh_end(inode_map); ++k) {
+		if (!kh_exist(inode_map, k)) {
+			continue;
+		}
+		if (inotify_rm_watch(inotify->fd, (int)kh_key(inode_map, k)) && (errno != EINVAL)) {
+			/* EINVAL is the normal end of a watch on a deleted directory. */
+			XAL_DEBUG("FAILED: inotify_rm_watch(%d); errno(%d)",
+				  (int)kh_key(inode_map, k), errno);
+		}
+	}
+
 	kh_clear(wd_to_inode, inode_map);
 
 	return 0;
@@ -142,7 +160,11 @@ int
 xal_be_fiemap_inotify_add_watcher(struct xal_inotify *inotify, char *path, struct xal_inode *inode)
 {
 	khash_t(wd_to_inode) *inode_map;
-	uint32_t mask = IN_CREATE | IN_DELETE | IN_MOVE | IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE | IN_UNMOUNT;
+	/* IN_MOVE_SELF and IN_DELETE_SELF report on the watched directory itself. Without them the
+	 * index root's disappearance is invisible: every other directory is covered by the watch
+	 * on its parent, and nothing watches above the root. */
+	uint32_t mask = IN_CREATE | IN_DELETE | IN_MOVE | IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE |
+			IN_MOVE_SELF | IN_DELETE_SELF | IN_UNMOUNT;
 	khiter_t iter;
 	int wd, err;
 
@@ -193,6 +215,18 @@ inotify_event_mask_pp(uint32_t mask, char *str, int str_sz) {
 	}
 	if (mask & IN_MOVE) {
 		wrtn = snprintf(str + idx, str_sz - idx, "%s", " IN_MOVE");
+		idx += wrtn;
+	}
+	if (mask & IN_MOVE_SELF) {
+		wrtn = snprintf(str + idx, str_sz - idx, "%s", " IN_MOVE_SELF");
+		idx += wrtn;
+	}
+	if (mask & IN_DELETE_SELF) {
+		wrtn = snprintf(str + idx, str_sz - idx, "%s", " IN_DELETE_SELF");
+		idx += wrtn;
+	}
+	if (mask & IN_IGNORED) {
+		wrtn = snprintf(str + idx, str_sz - idx, "%s", " IN_IGNORED");
 		idx += wrtn;
 	}
 	if (mask & IN_ISDIR) {
@@ -322,6 +356,15 @@ check_events(struct xal *xal, struct xal_inotify *inotify)
 				return XAL_INOTIFY_REINDEX;
 			}
 
+			/* A watch descriptor is gone, not a filesystem change: this follows every
+			 * inotify_rm_watch(). A directory deleted under a watch is already
+			 * reported by IN_DELETE on the parent, or IN_DELETE_SELF when it was the
+			 * index root. */
+			if (event->mask & IN_IGNORED) {
+				i += sizeof(struct inotify_event) + event->len;
+				continue;
+			}
+
 			/* The only fatal one: the filesystem is gone, so there is neither
 			 * anything left to watch nor anything a re-index could recover. */
 			if (event->mask & IN_UNMOUNT) {
@@ -407,13 +450,41 @@ background_thread_start(void *arg)
 				if (be->inotify->cb) {
 					be->inotify->cb(xal, be->inotify->cb_args);
 				}
-				cb_seq = seq;
+
+				/* xal_index() advances seq_lock twice whether or not it worked,
+				 * so on failure the advance is not a new version. Latch to where
+				 * it ended up, so as to not fire again. */
+				cb_seq = atomic_load(&xal->last_index_err) ? atomic_load(xal->seq_lock)
+									  : seq;
 				continue;
 			}
 
-			/* Already notified for this version, and the queue cannot help: events
-			 * pending there would make a poll on the fd return at once. */
-			poll(NULL, 0, XAL_INOTIFY_POLL_TIMEOUT_MS);
+			/* Already fired for this version; only a new event re-arms us, and it must
+			 * be read through check_events(), which tells a change from IN_IGNORED and
+			 * from our own snapshot work. The poll is the wait; the fd is non-blocking. */
+			err = poll(&pfd, 1, XAL_INOTIFY_POLL_TIMEOUT_MS);
+			if (err < 0) {
+				if (errno == EINTR) {
+					continue;
+				}
+				err = -errno;
+				XAL_DEBUG("FAILED: poll(); err(%d), exit thread", err);
+				xal_mark_dirty(xal);
+				goto exit_thread;
+			}
+			if (!err) {
+				continue;
+			}
+
+			err = check_events(xal, be->inotify);
+			if (err < 0) {
+				XAL_DEBUG("FAILED: check_events(); err(%d), exit thread", err);
+				xal_mark_dirty(xal);
+				goto exit_thread;
+			}
+			if (err == XAL_INOTIFY_REINDEX) {
+				cb_seq = -1;
+			}
 			continue;
 		}
 
@@ -499,6 +570,14 @@ xal_watch_filesystem(struct xal *xal, xal_dirty_cb cb, void *cb_args)
 	if (xal->root_idx == XAL_POOL_IDX_NONE) {
 		XAL_DEBUG("FAILED: Missing call to xal_index()");
 		return -EINVAL;
+	}
+
+	/* root_idx is claimed before the walk, so the check above catches an index that never ran
+	 * but not one that ran and failed. */
+	if (atomic_load(&xal->last_index_err)) {
+		XAL_DEBUG("FAILED: the last index failed; err(%d)",
+			  atomic_load(&xal->last_index_err));
+		return atomic_load(&xal->last_index_err);
 	}
 
 	be->inotify->cb = cb;

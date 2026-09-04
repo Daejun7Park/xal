@@ -409,6 +409,7 @@ xal_index(struct xal *xal)
 
 	err = be->index(xal);
 
+	atomic_store(&xal->last_index_err, err);
 	atomic_store(&xal->indexing, false);
 
 	return err;

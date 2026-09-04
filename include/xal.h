@@ -82,6 +82,11 @@ struct xal {
 	 * that state cannot also be the thing that excludes an index. Not shared: a secondary
 	 * cannot index. */
 	atomic_bool indexing;
+
+	/* Result of the last completed xal_index(). The watch loop cannot infer it -- a failed
+	 * index and a successful one with a mark landing mid-rebuild both leave DIRTY with
+	 * seq_lock advanced, and want opposite treatment. Not set by the -EBUSY path. */
+	atomic_int last_index_err;
 };
 
 int

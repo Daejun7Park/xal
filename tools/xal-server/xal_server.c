@@ -9,7 +9,6 @@
  */
 #include <errno.h>
 #include <signal.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,22 +28,17 @@ on_signal(int signo __attribute__((unused)))
 }
 
 /**
- * Per-device state for the watch callback
- *
- * The callback has to remember a failed re-index across invocations, and the parsed
- * configuration it would otherwise carry is shared and const, so the flag lives here.
+ * Per-device context for the watch callback
  */
 struct xal_server_watch {
 	const struct xal_server_dev *dev;
-	bool index_failed;
 };
 
 /**
  * Re-index the device whose filesystem the watcher reports as changed
  *
  * Runs on the watch thread. A failure leaves the index dirty for readers to see through
- * xal_is_dirty(), and is not recoverable from here. It is also latched, so the rebuild and
- * the log line happen once instead of on every subsequent notification.
+ * xal_is_dirty(); the watch tries again on the next change it sees.
  */
 static void
 on_dirty(struct xal *xal, void *cb_args)
@@ -52,19 +46,9 @@ on_dirty(struct xal *xal, void *cb_args)
 	struct xal_server_watch *watch = cb_args;
 	int err;
 
-	/* xal_index() advances seq_lock on its exit path whether or not it succeeded, and the
-	 * watch loop fires again on any advance while the state is dirty. Returning without the
-	 * latch would rebuild the pools and emit LOG_CRIT back to back with nothing to stop it. */
-	if (watch->index_failed) {
-		return;
-	}
-
 	err = xal_index(xal);
 	if (err) {
-		watch->index_failed = true;
-		syslog(LOG_CRIT,
-		       "FAILED: xal_index(%s); err(%d); the index is stale, restart "
-		       "required",
+		syslog(LOG_ERR, "FAILED: xal_index(%s); err(%d); retried on the next change",
 		       watch->dev->shm_name, err);
 		return;
 	}
