@@ -88,8 +88,14 @@ struct xal_opts {
 	enum xal_watchmode watch_mode;
 	enum xal_file_lookupmode file_lookupmode;
 	const char *mountpoint;
-	const char *shm_name; ///< If set, pool memory is backed by POSIX shared memory with this base name, see @xal_from_pools() for sharing the pools across processes
-	const char *subtree; ///< FIEMAP backend only: absolute path at or under the mountpoint to scope the index to. Only files under it are indexed (and, in XAL_WATCHMODE_REFLINK_SNAPSHOT, reflinked). NULL/empty indexes the whole mount. Ignored by the XFS backend.
+	/** If set, pool memory is backed by POSIX shared memory under this base name; see
+	 *  xal_from_shm() for attaching to the pools from another process. */
+	const char *shm_name;
+
+	/** FIEMAP backend only: absolute path at or under the mountpoint to scope the index to.
+	 *  Only files beneath it are indexed, and in XAL_WATCHMODE_REFLINK_SNAPSHOT only those
+	 *  are reflinked. NULL or empty indexes the whole mount. Ignored by the XFS backend. */
+	const char *subtree;
 };
 
 struct xal_extent {
@@ -571,7 +577,7 @@ xal_get_inode(struct xal *xal, char *path, struct xal_inode **inode);
  * Build a path-to-inode hash map from the in-memory inode tree.
  *
  * Intended for use after xal_open() without opts->file_lookupmode not set to 
- * XAL_FILE_LOOKUPMODE_HASHMAP, or after xal_from_pools(), where xal_index() is not
+ * XAL_FILE_LOOKUPMODE_HASHMAP, or after xal_from_shm(), where xal_index() is not
  * called but the caller wants constant-time inode lookup via xal_get_inode(). Walks
  * the existing tree and populates the hash map locally. Any previously existing
  * map is replaced.
