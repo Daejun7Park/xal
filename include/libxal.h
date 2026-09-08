@@ -378,6 +378,10 @@ xal_dinodes_retrieve(struct xal *xal);
  * the two to be refused. Interleaved indexes are not merely wasteful -- they can produce extents
  * that were never a file's, from a call that reports success.
  *
+ * While this runs, an event the watch thread reads counts as a change, even one naming an entry
+ * the index skips. A caller that re-indexes from its own thread while a watch runs can therefore
+ * cost one extra re-index.
+ *
  * This function will fail if given a xal handle obtained from xal_from_shm().
  *
  * @returns On success, 0 is returned. On error, negative errno is returned to indicate the error.
@@ -418,10 +422,8 @@ typedef void (*xal_dirty_cb)(struct xal *xal, void *cb_args);
  * If these assumptions do not hold, this will result in an error.
  *
  * This call, xal_stop_watching_filesystem() and xal_close() all act on the same watch thread and
- * must be serialised by the caller, including against themselves: two concurrent starts can each
- * create a thread and leave one of them unjoinable, and two concurrent stops can join the same
- * thread twice. None of them may be called from xal_dirty_cb, since that runs on the watch thread
- * and would join itself.
+ * must be serialised by the caller, including against themselves. None of them may be called
+ * from xal_dirty_cb.
  *
  * @param xal     The xal struct obtained when opened with xal_open().
  * @param cb      Optional callback invoked when xal becomes dirty. May be NULL.

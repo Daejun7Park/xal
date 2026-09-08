@@ -31,17 +31,51 @@ KHASH_MAP_INIT_INT64(wd_to_inode, struct xal_inode *);
 static bool
 xal_be_fiemap_inotify_is_live(struct xal_inotify *inotify)
 {
-	int flag;
+	return !(atomic_load(&inotify->flag) & XAL_BE_FIEMAP_INOTIFY_EXITED);
+}
 
-	flag = atomic_load(&inotify->flag);
+/**
+ * Take ownership of the watch thread for joining, under the lifecycle lock
+ *
+ * Returns 0 and fills @tid for the caller that takes JOINABLE, so two reapers cannot both join the
+ * same thread; -EINVAL when there is no thread to join; -EDEADLK when called from the watch thread
+ * itself, refused before storing stop so a failed call does not stop the watcher. The join is left
+ * to the caller and happens outside the lock: a stop can take up to XAL_INOTIFY_POLL_TIMEOUT_MS to
+ * be noticed.
+ *
+ * EXITED is left alone: a claimed thread must read as live until it has exited, or a start racing
+ * the join would reset the stop it has yet to see.
+ */
+static int
+inotify_claim_join(struct xal_inotify *inotify, bool request_stop, pthread_t *tid)
+{
+	int err = -EINVAL;
 
-	return (flag & XAL_BE_FIEMAP_INOTIFY_JOINABLE) && !(flag & XAL_BE_FIEMAP_INOTIFY_EXITED);
+	pthread_mutex_lock(&inotify->lifecycle);
+
+	if (atomic_load(&inotify->flag) & XAL_BE_FIEMAP_INOTIFY_JOINABLE) {
+		if (pthread_equal(pthread_self(), inotify->watch_thread_id)) {
+			err = -EDEADLK;
+		} else {
+			atomic_fetch_and(&inotify->flag, ~XAL_BE_FIEMAP_INOTIFY_JOINABLE);
+			if (request_stop) {
+				atomic_store(&inotify->stop, true);
+			}
+			*tid = inotify->watch_thread_id;
+			err = 0;
+		}
+	}
+
+	pthread_mutex_unlock(&inotify->lifecycle);
+
+	return err;
 }
 
 void
 xal_be_fiemap_inotify_close(struct xal_inotify *inotify)
 {
 	kh_wd_to_inode_t *inode_map;
+	pthread_t tid;
 
 	if (!inotify) {
 		XAL_DEBUG("SKIPPED: No xal_inotify given")
@@ -50,16 +84,10 @@ xal_be_fiemap_inotify_close(struct xal_inotify *inotify)
 
 	inode_map = inotify->inode_map;
 
-	/* Reap whether it was told to stop or exited on its own. JOINABLE says watch_thread_id
-	 * names a thread nobody has joined yet, which is what makes the join safe; EXITED only says
-	 * whether it will return at once. A thread that has already exited ignores the stop, so
-	 * requesting it here costs nothing and is what keeps a live one from being joined
-	 * forever. */
-	if (atomic_load(&inotify->flag) & XAL_BE_FIEMAP_INOTIFY_JOINABLE) {
-		atomic_store(&inotify->stop, true);
-		pthread_join(inotify->watch_thread_id, NULL);
-		atomic_fetch_and(&inotify->flag,
-				 ~(XAL_BE_FIEMAP_INOTIFY_JOINABLE | XAL_BE_FIEMAP_INOTIFY_EXITED));
+	/* Reap whether it was told to stop or exited on its own: a thread that has already exited
+	 * ignores the stop. */
+	if (!inotify_claim_join(inotify, true, &tid)) {
+		pthread_join(tid, NULL);
 	}
 
 	if (inode_map) {
@@ -71,22 +99,44 @@ xal_be_fiemap_inotify_close(struct xal_inotify *inotify)
 		close(inotify->fd);
 		inotify->fd = -1;
 	}
+
+	/* Last, and only safe because the caller owns the handle by now: this frees the locks that
+	 * guard the start path and the index. A concurrent xal_watch_filesystem() is a
+	 * use-after-free of the handle -- bad usage. */
+	pthread_mutex_destroy(&inotify->index_lock);
+	pthread_mutex_destroy(&inotify->lifecycle);
 }
 
 int
 xal_be_fiemap_inotify_init(struct xal_inotify *inotify, enum xal_watchmode watch_mode)
 {
+	int err;
+
 	if (!inotify) {
 		XAL_DEBUG("FAILED: No xal_inotify given");
 		return -EINVAL;
 	}
 
 	inotify->watch_mode = watch_mode;
-	atomic_init(&inotify->flag, 0);
+	/* No thread exists yet, which is what EXITED says. */
+	atomic_init(&inotify->flag, XAL_BE_FIEMAP_INOTIFY_EXITED);
 	atomic_init(&inotify->stop, false);
 
 	/* calloc() leaves this 0, which names stdin rather than nothing. */
 	inotify->fd = -1;
+
+	err = pthread_mutex_init(&inotify->lifecycle, NULL);
+	if (err) {
+		XAL_DEBUG("FAILED: pthread_mutex_init(); err(%d)", err);
+		return -err;
+	}
+
+	err = pthread_mutex_init(&inotify->index_lock, NULL);
+	if (err) {
+		XAL_DEBUG("FAILED: pthread_mutex_init(); err(%d)", err);
+		pthread_mutex_destroy(&inotify->lifecycle);
+		return -err;
+	}
 
 	if (!inotify->watch_mode) {
 		XAL_DEBUG("INFO: Skipping xal_be_fiemap_inotify_init(), watch mode none given");
@@ -95,17 +145,29 @@ xal_be_fiemap_inotify_init(struct xal_inotify *inotify, enum xal_watchmode watch
 
 	inotify->fd = inotify_init1(IN_NONBLOCK);
 	if (inotify->fd < 0) {
-		XAL_DEBUG("FAILED: inotify_init1(); errno(%d)", errno);
-		return -errno;
+		err = -errno;
+		XAL_DEBUG("FAILED: inotify_init1(); err(%d)", err);
+		goto failed;
 	}
 
 	inotify->inode_map = kh_init(wd_to_inode);
 	if (!inotify->inode_map) {
 		XAL_DEBUG("FAILED: kh_init()");
-		return -EINVAL;
+		err = -EINVAL;
+		goto failed;
 	}
 
 	return 0;
+
+failed:
+	if (inotify->fd >= 0) {
+		close(inotify->fd);
+		inotify->fd = -1;
+	}
+	pthread_mutex_destroy(&inotify->index_lock);
+	pthread_mutex_destroy(&inotify->lifecycle);
+
+	return err;
 }
 
 int
@@ -386,13 +448,24 @@ check_events(struct xal *xal, struct xal_inotify *inotify)
 			/* The index skips symlinks, special files and mount points, so an event naming
 			 * an entry it lacks is ignored when statx() finds one of those there. Only a
 			 * clean index is consulted: xal_inode_path() refuses a dirty one, and a failed
-			 * index lacking an entry proves nothing. */
-			inode = NULL;
-			if (event->len && !event_entry(xal, inotify, event, &inode, path, sizeof(path)) &&
-			    !inode && path_is_skipped(path)) {
-				XAL_DEBUG("INFO: ignoring event on skipped entry; name(%s)", event->name);
-				i += sizeof(struct inotify_event) + event->len;
-				continue;
+			 * index lacking an entry proves nothing. The lookup reads the watch map and the
+			 * pools, which xal_index() rewrites under index_lock; while xal->indexing is
+			 * set, or when the trylock fails, the event counts as a change. */
+			if (event->len && !atomic_load(&xal->indexing) &&
+			    !pthread_mutex_trylock(&inotify->index_lock)) {
+				bool missing;
+
+				inode = NULL;
+				missing = !event_entry(xal, inotify, event, &inode, path, sizeof(path)) &&
+					  !inode;
+				pthread_mutex_unlock(&inotify->index_lock);
+
+				if (missing && path_is_skipped(path)) {
+					XAL_DEBUG("INFO: ignoring event on skipped entry; name(%s)",
+						  event->name);
+					i += sizeof(struct inotify_event) + event->len;
+					continue;
+				}
 			}
 
 			/* Every surviving event means the same thing. The clones hold the blocks,
@@ -524,7 +597,7 @@ background_thread_start(void *arg)
 	}
 
 exit_thread:
-	XAL_DEBUG("INFO: unlocked xal lock");
+	XAL_DEBUG("INFO: watch thread exiting");
 
 	if (be->inotify) {
 		atomic_fetch_or(&be->inotify->flag, XAL_BE_FIEMAP_INOTIFY_EXITED);
@@ -556,17 +629,8 @@ xal_watch_filesystem(struct xal *xal, xal_dirty_cb cb, void *cb_args)
 		return -EINVAL;
 	}
 
-	if (xal_be_fiemap_inotify_is_live(be->inotify)) {
-		XAL_DEBUG("SKIPPED: thread already running");
-		return 0;
-	}
-
-	if (atomic_load(&be->inotify->flag) & XAL_BE_FIEMAP_INOTIFY_JOINABLE) {
-		pthread_join(be->inotify->watch_thread_id, NULL);
-		atomic_fetch_and(&be->inotify->flag,
-				 ~(XAL_BE_FIEMAP_INOTIFY_JOINABLE | XAL_BE_FIEMAP_INOTIFY_EXITED));
-	}
-
+	/* Checked before the lock: neither has anything to do with the watch thread, and taking
+	 * the lock only to fail would let a caller with a broken index block a reaper. */
 	if (xal->root_idx == XAL_POOL_IDX_NONE) {
 		XAL_DEBUG("FAILED: Missing call to xal_index()");
 		return -EINVAL;
@@ -580,24 +644,44 @@ xal_watch_filesystem(struct xal *xal, xal_dirty_cb cb, void *cb_args)
 		return atomic_load(&xal->last_index_err);
 	}
 
+	/* watch_thread_id and JOINABLE are published together under this lock: a reaper sees
+	 * neither, or a written id and JOINABLE, never one without the other. */
+	pthread_mutex_lock(&be->inotify->lifecycle);
+
+	/* Live includes a thread a reaper has claimed but not yet seen exit. */
+	if (xal_be_fiemap_inotify_is_live(be->inotify)) {
+		pthread_mutex_unlock(&be->inotify->lifecycle);
+		XAL_DEBUG("SKIPPED: thread already running");
+		return 0;
+	}
+
+	/* Not live, so a JOINABLE thread here has already exited and this join returns at once;
+	 * holding the lock across it costs nothing. */
+	if (atomic_load(&be->inotify->flag) & XAL_BE_FIEMAP_INOTIFY_JOINABLE) {
+		pthread_join(be->inotify->watch_thread_id, NULL);
+		atomic_fetch_and(&be->inotify->flag, ~XAL_BE_FIEMAP_INOTIFY_JOINABLE);
+	}
+
 	be->inotify->cb = cb;
 	be->inotify->cb_args = cb_args;
 	atomic_store(&be->inotify->stop, false);
 
-	/* No thread of ours is running here, so a bit left from an earlier one would only make the
-	 * one created below look exited. */
+	/* Cleared before the thread exists, so the EXITED it raises can never be overwritten. */
 	atomic_fetch_and(&be->inotify->flag, ~XAL_BE_FIEMAP_INOTIFY_EXITED);
 
 	err = pthread_create(&be->inotify->watch_thread_id, NULL, &background_thread_start, xal);
 	if (err) {
+		atomic_fetch_or(&be->inotify->flag, XAL_BE_FIEMAP_INOTIFY_EXITED);
+	} else {
+		atomic_fetch_or(&be->inotify->flag, XAL_BE_FIEMAP_INOTIFY_JOINABLE);
+	}
+
+	pthread_mutex_unlock(&be->inotify->lifecycle);
+
+	if (err) {
 		XAL_DEBUG("FAILED: pthread_create(); err(%d)", err);
 		return -err;
 	}
-
-	/* Raised only now: until pthread_create() returns, watch_thread_id names no thread a reaper
-	 * may join. A thread that exits before this store leaves EXITED behind, which this does not
-	 * disturb, so the two sides never overwrite each other. */
-	atomic_fetch_or(&be->inotify->flag, XAL_BE_FIEMAP_INOTIFY_JOINABLE);
 
 	return 0;
 }
@@ -607,6 +691,7 @@ xal_stop_watching_filesystem(struct xal *xal)
 {
 	struct xal_backend_base *base;
 	struct xal_be_fiemap *be;
+	pthread_t tid;
 	int err;
 
 	if (!xal) {
@@ -626,29 +711,20 @@ xal_stop_watching_filesystem(struct xal *xal)
 		return -EINVAL;
 	}
 
-	if (!(atomic_load(&be->inotify->flag) & XAL_BE_FIEMAP_INOTIFY_JOINABLE)) {
-		XAL_DEBUG("FAILED: no thread to stop");
-		return -EINVAL;
-	}
-
-	/* Refuse a self-join before storing stop, so a call from xal_dirty_cb does not stop the
-	 * watcher as a side effect of failing. */
-	if (pthread_equal(pthread_self(), be->inotify->watch_thread_id)) {
-		XAL_DEBUG("FAILED: called from the watch thread");
-		return -EDEADLK;
-	}
-
-	atomic_store(&be->inotify->stop, true);
-	err = pthread_join(be->inotify->watch_thread_id, NULL);
+	/* Reaped the same way whether it was told to stop or exited on its own. */
+	err = inotify_claim_join(be->inotify, true, &tid);
 	if (err) {
-		/* ESRCH or EINVAL: there is nothing left to reap, so clear the bits anyway. 
-		 * EDEADLK is caught by the if-statement above. */
-		XAL_DEBUG("FAILED: pthread_join(); err(%d)", err);
-		err = -err;
+		XAL_DEBUG("FAILED: inotify_claim_join(); err(%d)", err);
+		return err;
 	}
 
-	atomic_fetch_and(&be->inotify->flag,
-			 ~(XAL_BE_FIEMAP_INOTIFY_JOINABLE | XAL_BE_FIEMAP_INOTIFY_EXITED));
+	err = pthread_join(tid, NULL);
+	if (err) {
+		/* ESRCH or EINVAL: nothing is left to reap, and the claim has already dropped
+		 * JOINABLE. */
+		XAL_DEBUG("FAILED: pthread_join(); err(%d)", err);
+		return -err;
+	}
 
-	return err;
+	return 0;
 }
