@@ -182,7 +182,7 @@ xal_inode_pp(struct xal *xal, struct xal_inode *inode)
 	case XAL_ODF_DIR3_FT_DIR:
 		wrtn += printf("  dentries.count: %u\n", inode->content.dentries.count);
 
-		for (uint8_t i = 0; i < inode->content.dentries.count; ++i) {
+		for (uint32_t i = 0; i < inode->content.dentries.count; ++i) {
 			struct xal_inode *child = xal_inode_at(xal, inode->content.dentries.inodes_idx + i);
 
 			if (!child) {
