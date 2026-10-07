@@ -175,6 +175,7 @@ xal_be_fiemap_inotify_drain(struct xal_inotify *inotify)
 {
 	char buf[4096];
 	ssize_t len;
+	int err;
 
 	if (!inotify) {
 		XAL_DEBUG("FAILED: No inotify object given");
@@ -184,6 +185,13 @@ xal_be_fiemap_inotify_drain(struct xal_inotify *inotify)
 	do {
 		len = read(inotify->fd, buf, sizeof(buf));
 	} while (len > 0);
+
+	/* The fd is non-blocking: EAGAIN is the queue running dry. */
+	if (len < 0 && errno != EAGAIN) {
+		err = -errno;
+		XAL_DEBUG("FAILED: read(); err(%d)", err);
+		return err;
+	}
 
 	return 0;
 }
@@ -397,6 +405,7 @@ check_events(struct xal *xal, struct xal_inotify *inotify)
 	char path[XAL_INODE_PATH_MAXLEN + 1];
 	struct xal_inode *inode;
 	ssize_t len, i;
+	int err;
 
 	len = read(inotify->fd, buf, sizeof buf);
 	while (len > 0) {
@@ -479,6 +488,13 @@ check_events(struct xal *xal, struct xal_inotify *inotify)
 		}
 
 		len = read(inotify->fd, buf, sizeof buf);
+	}
+
+	/* The fd is non-blocking: EAGAIN is the queue running dry, anything else ends the watch. */
+	if (len < 0 && errno != EAGAIN) {
+		err = -errno;
+		XAL_DEBUG("FAILED: read(); err(%d)", err);
+		return err;
 	}
 
 	return XAL_INOTIFY_NOCHANGE;
