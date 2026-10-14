@@ -915,6 +915,9 @@ read_fiemap(int fd, struct fiemap **fiemap_ptr)
 		XAL_DEBUG("FAILED: fiemap realloc(); errno(%d)", errno);
 		return -errno;
 	}
+	// A moved buffer has freed the old one, and the caller frees *fiemap_ptr on every path, so
+	// hand the new one back before anything else can fail.
+	*fiemap_ptr = fiemap;
 
 	memset(fiemap->fm_extents, 0, extents_size);
 	fiemap->fm_extent_count = fiemap->fm_mapped_extents;
@@ -927,7 +930,6 @@ read_fiemap(int fd, struct fiemap **fiemap_ptr)
 		return -errno;
 	}
 
-	*fiemap_ptr = fiemap;
 	return 0;
 }
 
