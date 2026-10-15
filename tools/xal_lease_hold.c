@@ -1,0 +1,377 @@
+/**
+ * xal_lease_hold -- hold a file's extents under XAL_WATCHMODE_READ_LEASE
+ * ======================================================================
+ *
+ * Opens the FIEMAP backend in XAL_WATCHMODE_READ_LEASE, indexes, and acquires the extents of
+ * <file> with xal_extents_acquire(), which takes a read lease on it. This is a test aid: it lets a
+ * test check that a writer of <file> waits while the extents are held and that the extents still
+ * hold the file's data meanwhile.
+ *
+ * Usage: xal_lease_hold <dev_uri> <mountpoint> <file>
+ *                       [--probe | --shm | --thread | --fork | --orphan | --idle <file2>]
+ *
+ * Without an option, prints once the extents are held:
+ *   LEASE_READY pid=<pid> byte=<device byte offset of the first extent> extents=<n>
+ * then waits for SIGUSR1, releases the extents and prints RELEASED. It then acquires them again
+ * every 50 ms until that succeeds, which it can once the writer has closed the file, and prints
+ *   REACQUIRED byte=<device byte offset of the first extent> extents=<n>
+ * and waits for SIGTERM or SIGINT before closing.
+ *
+ * --thread takes the first acquire on a thread that exits before LEASE_READY is printed, as a
+ * caller's worker thread may. --idle also acquires and releases <file2> before LEASE_READY, so
+ * <file2> is under a lease with no reader while <file> is held.
+ *
+ * --probe acquires once, prints ACQUIRE err=<err> and, on success, one line per extent:
+ *   EXTENT <i> byte=<device byte offset> bytes=<length> flag=<flag>
+ * then exits. --shm opens with a shm_name, prints OPEN err=<err> and exits. --fork acquires and
+ * releases, forks a child that acquires, prints CHILD_ACQUIRE err=<err> and CHILD_STATS err=<what
+ * xal_lease_stats() returned>, opens /dev/null 64 times, closes the handle and prints
+ * CHILD_FDS=<how many of those are still open>/<how many it opened>, then prints PARENT_LEASE=<n>,
+ * the number of leases on <file> listed in /proc/locks, and exits. --orphan acquires and releases,
+ * forks a child that sleeps for 30 s, or until a signal, with the handle open, prints ORPHAN
+ * child=<pid> once fork() has returned in the child, and exits without xal_close().
+ */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <libxal.h>
+
+static volatile sig_atomic_t g_release = 0;
+static volatile sig_atomic_t g_stop = 0;
+
+static void
+on_signal(int signo)
+{
+	if (signo == SIGUSR1) {
+		g_release = 1;
+	} else {
+		g_stop = 1;
+	}
+}
+
+static uint64_t
+first_byte(struct xal *xal, struct xal_extents *extents)
+{
+	if (!extents->count) {
+		return 0;
+	}
+
+	return xal_extent_at(xal, extents->extent_idx)->start_block * xal_get_sb_blocksize(xal);
+}
+
+static int
+probe(struct xal *xal, struct xal_inode *inode)
+{
+	struct xal_extents *extents;
+	uint32_t blocksize = xal_get_sb_blocksize(xal);
+	int err;
+
+	err = xal_extents_acquire(xal, inode, &extents);
+	printf("ACQUIRE err=%d\n", err);
+	if (err) {
+		return 0;
+	}
+
+	for (uint32_t i = 0; i < extents->count; ++i) {
+		struct xal_extent *extent = xal_extent_at(xal, extents->extent_idx + i);
+
+		printf("EXTENT %u byte=%" PRIu64 " bytes=%" PRIu64 " flag=0x%02x\n", i,
+		       extent->start_block * blocksize, extent->nblocks * blocksize, extent->flag);
+	}
+	xal_extents_release(xal, inode);
+
+	return 0;
+}
+
+/* Leases on the inode, as /proc/locks lists them: "1: LEASE ACTIVE READ <pid> <maj:min:ino> ..." */
+static int
+count_leases(uint64_t ino)
+{
+	char line[256], suffix[32];
+	FILE *f = fopen("/proc/locks", "r");
+	int n = 0;
+
+	if (!f) {
+		return -1;
+	}
+	snprintf(suffix, sizeof(suffix), ":%" PRIu64 " ", ino);
+	while (fgets(line, sizeof(line), f)) {
+		if (strstr(line, "LEASE") && strstr(line, suffix)) {
+			n++;
+		}
+	}
+	fclose(f);
+
+	return n;
+}
+
+static int
+fork_probe(struct xal *xal, struct xal_inode *inode)
+{
+	struct xal_extents *extents;
+	int err, status;
+	pid_t pid;
+
+	err = xal_extents_acquire(xal, inode, &extents);
+	if (err) {
+		fprintf(stderr, "FAILED: xal_extents_acquire(); err(%d)\n", err);
+		return 1;
+	}
+	xal_extents_release(xal, inode);
+	fflush(stdout);
+
+	pid = fork();
+	if (pid < 0) {
+		return 1;
+	}
+	if (!pid) {
+		struct xal_lease_stats stats;
+		int fds[64], opened = 0, open_fds = 0;
+
+		printf("CHILD_ACQUIRE err=%d\n", xal_extents_acquire(xal, inode, &extents));
+		printf("CHILD_STATS err=%d\n", xal_lease_stats(xal, &stats));
+		fflush(stdout);
+		/* These reuse the numbers of the descriptors the fork handler closed */
+		for (int i = 0; i < 64; ++i) {
+			fds[i] = open("/dev/null", O_RDONLY);
+			opened += fds[i] >= 0;
+		}
+		xal_close(xal);
+		for (int i = 0; i < 64; ++i) {
+			open_fds += fds[i] >= 0 && fcntl(fds[i], F_GETFD) >= 0;
+		}
+		printf("CHILD_FDS=%d/%d\n", open_fds, opened);
+		fflush(stdout);
+		_exit(0);
+	}
+	waitpid(pid, &status, 0);
+
+	printf("PARENT_LEASE=%d\n", count_leases(inode->ino));
+
+	return 0;
+}
+
+static int
+orphan(struct xal *xal, struct xal_inode *inode)
+{
+	struct xal_extents *extents;
+	int err, ready[2];
+	pid_t pid;
+	char c;
+
+	err = xal_extents_acquire(xal, inode, &extents);
+	if (err) {
+		fprintf(stderr, "FAILED: xal_extents_acquire(); err(%d)\n", err);
+		return 1;
+	}
+	xal_extents_release(xal, inode);
+	fflush(stdout);
+
+	if (pipe(ready)) {
+		return 1;
+	}
+	pid = fork();
+	if (pid < 0) {
+		return 1;
+	}
+	if (!pid) {
+		sigset_t set;
+
+		/* fork() has returned, so the fork handlers have run */
+		sigemptyset(&set);
+		sigaddset(&set, SIGUSR1);
+		sigaddset(&set, SIGTERM);
+		sigaddset(&set, SIGINT);
+		sigprocmask(SIG_UNBLOCK, &set, NULL);
+		if (write(ready[1], "", 1) == 1) {
+			sleep(30);
+		}
+		_exit(0);
+	}
+	close(ready[1]);
+	if (read(ready[0], &c, 1) != 1) {
+		return 1;
+	}
+	printf("ORPHAN child=%d\n", (int)pid);
+	fflush(stdout);
+	_exit(0);
+}
+
+struct acquire_args {
+	struct xal *xal;
+	struct xal_inode *inode;
+	struct xal_extents *extents;
+	int err;
+};
+
+static void *
+acquire_thread(void *arg)
+{
+	struct acquire_args *a = arg;
+
+	a->err = xal_extents_acquire(a->xal, a->inode, &a->extents);
+
+	return NULL;
+}
+
+static int
+hold(struct xal *xal, struct xal_inode *inode, struct xal_inode *idle, bool on_thread,
+     const sigset_t *orig)
+{
+	struct timespec retry = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000};
+	struct acquire_args a = {.xal = xal, .inode = inode};
+	struct xal_extents *extents;
+	int err;
+
+	if (idle) {
+		err = xal_extents_acquire(xal, idle, &extents);
+		if (err) {
+			fprintf(stderr, "FAILED: xal_extents_acquire(idle); err(%d)\n", err);
+			return 1;
+		}
+		xal_extents_release(xal, idle);
+	}
+
+	if (on_thread) {
+		pthread_t t;
+
+		if (pthread_create(&t, NULL, acquire_thread, &a) || pthread_join(t, NULL)) {
+			fprintf(stderr, "FAILED: acquire thread\n");
+			return 1;
+		}
+	} else {
+		acquire_thread(&a);
+	}
+	err = a.err;
+	extents = a.extents;
+	if (err) {
+		fprintf(stderr, "FAILED: xal_extents_acquire(); err(%d)\n", err);
+		return 1;
+	}
+	printf("LEASE_READY pid=%d byte=%" PRIu64 " extents=%u\n", (int)getpid(),
+	       first_byte(xal, extents), extents->count);
+	fflush(stdout);
+
+	while (!g_release && !g_stop) {
+		sigsuspend(orig);
+	}
+	xal_extents_release(xal, inode);
+	printf("RELEASED\n");
+	fflush(stdout);
+
+	for (int i = 0; i < 600 && !g_stop; ++i) {
+		err = xal_extents_acquire(xal, inode, &extents);
+		if (!err) {
+			printf("REACQUIRED byte=%" PRIu64 " extents=%u\n", first_byte(xal, extents),
+			       extents->count);
+			fflush(stdout);
+			xal_extents_release(xal, inode);
+			break;
+		}
+		nanosleep(&retry, NULL);
+	}
+	if (err) {
+		fprintf(stderr, "FAILED: re-acquire; err(%d)\n", err);
+	}
+
+	while (!g_stop) {
+		sigsuspend(orig);
+	}
+
+	return err ? 1 : 0;
+}
+
+int
+main(int argc, char *argv[])
+{
+	struct xal_opts opts = {0};
+	struct sigaction sa = {0};
+	sigset_t block, orig;
+	struct xal_inode *inode, *idle = NULL;
+	struct xal *xal;
+	const char *option = argc >= 5 ? argv[4] : "";
+	int err, ret;
+
+	if (argc < 4 || argc > 6 ||
+	    (argc == 5 && strcmp(option, "--probe") && strcmp(option, "--shm") &&
+	     strcmp(option, "--thread") && strcmp(option, "--fork") &&
+	     strcmp(option, "--orphan")) ||
+	    (argc == 6 && strcmp(option, "--idle"))) {
+		fprintf(stderr,
+			"Usage: %s <dev_uri> <mountpoint> <file> "
+			"[--probe | --shm | --thread | --fork | --orphan | --idle <file2>]\n",
+			argv[0]);
+		return 2;
+	}
+
+	// Blocked so that only hold(), where it waits for them, and orphan()'s child take these
+	sa.sa_handler = on_signal;
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGUSR1, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGINT, &sa, NULL);
+	sigemptyset(&block);
+	sigaddset(&block, SIGUSR1);
+	sigaddset(&block, SIGTERM);
+	sigaddset(&block, SIGINT);
+	sigprocmask(SIG_BLOCK, &block, &orig);
+
+	opts.be = XAL_BACKEND_FIEMAP;
+	opts.watch_mode = XAL_WATCHMODE_READ_LEASE;
+	opts.mountpoint = argv[2];
+	if (!strcmp(option, "--shm")) {
+		opts.shm_name = "/xal_lease_hold_test";
+	}
+
+	err = xal_open_from_uri(argv[1], &xal, &opts);
+	if (!strcmp(option, "--shm")) {
+		printf("OPEN err=%d\n", err);
+		if (!err) {
+			xal_close(xal);
+		}
+		return 0;
+	}
+	if (err) {
+		fprintf(stderr, "FAILED: xal_open_from_uri(); err(%d)\n", err);
+		return 1;
+	}
+
+	err = xal_index(xal);
+	if (!err) {
+		err = xal_get_inode(xal, argv[3], &inode);
+	}
+	if (!err && argc == 6) {
+		err = xal_get_inode(xal, argv[5], &idle);
+	}
+	if (err) {
+		fprintf(stderr, "FAILED: xal_index() or xal_get_inode(); err(%d)\n", err);
+		xal_close(xal);
+		return 1;
+	}
+
+	if (!strcmp(option, "--probe")) {
+		ret = probe(xal, inode);
+	} else if (!strcmp(option, "--fork")) {
+		ret = fork_probe(xal, inode);
+	} else if (!strcmp(option, "--orphan")) {
+		ret = orphan(xal, inode);
+	} else {
+		ret = hold(xal, inode, idle, !strcmp(option, "--thread"), &orig);
+	}
+
+	xal_close(xal);
+
+	return ret;
+}
