@@ -13,9 +13,10 @@
  * Per-file state in XAL_WATCHMODE_READ_LEASE
  *
  * UNMAPPED -> MAPPING -> VALID on the first xal_extents_acquire(). VALID -> REVOKING when the
- * kernel breaks the lease, and REVOKING -> REVOKED once the last reader has released and the lease
- * is dropped. UNSEALED marks a file that was open for writing when a lease was attempted. REVOKED
- * and UNSEALED files are mapped again by the next xal_extents_acquire() that can take a lease.
+ * kernel breaks the lease or a release finds the extents stale, and REVOKING -> REVOKED once the
+ * last reader has released and the lease is dropped. UNSEALED marks a file that was open for
+ * writing when a lease was attempted. REVOKED and UNSEALED files are mapped again by the next
+ * xal_extents_acquire() that can take a lease.
  */
 enum xal_lease_state {
 	XAL_LEASE_UNMAPPED = 0,
@@ -31,6 +32,9 @@ struct xal_lease_entry {
 	atomic_int state;    ///< One of enum xal_lease_state
 	atomic_uint readers; ///< Callers between xal_extents_acquire() and xal_extents_release()
 	uint32_t extent_cap; ///< Extents the region at inode->content.extents.extent_idx can hold
+	_Atomic uint64_t expire_ns; ///< CLOCK_MONOTONIC time from which a broken lease may have
+				    ///< timed out; 0 when it cannot, or after a stale release
+	atomic_bool stale;	    ///< A release found the extents may no longer hold the data
 };
 
 KHASH_MAP_INIT_INT(fd_to_idx, uint32_t)
@@ -45,10 +49,11 @@ struct xal_lease_set {
 	pthread_mutex_t lock;	///< Guards fd_map, the extents pool and publishing a mapping
 	struct xal_lease_stats stats;
 	struct xal_lease_set *next; ///< In the process-wide list of sets
+	bool recheck;		    ///< !xal_opts.lease_no_recheck
 };
 
 int
-xal_be_fiemap_lease_init(struct xal *xal, const char *mountpoint);
+xal_be_fiemap_lease_init(struct xal *xal, const char *mountpoint, const struct xal_opts *opts);
 
 /**
  * Release every lease and forget every mapping; for xal_index() before it clears the pools
