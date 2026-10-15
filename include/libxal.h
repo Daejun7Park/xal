@@ -701,7 +701,7 @@ xal_get_extents(struct xal *xal, char *path, struct xal_extents **extents);
  * waits until the last reader has released, xal then releases the lease, and the next call maps
  * the file again. Between the two calls the extents therefore describe the file's blocks, unless a
  * writeback of the file failed, see xal_index(). In other watch modes this returns the indexed
- * extents and pins nothing.
+ * extents and pins nothing. README.md lists what the mode needs and what it does not see.
  *
  * Every successful call must be paired with xal_extents_release() on the same inode. Neither may
  * run concurrently with xal_index() or xal_close() on the same handle, and xal_index() fails with

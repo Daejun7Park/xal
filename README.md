@@ -109,6 +109,55 @@ Neither can make an extent invalid -- the clone still pins the blocks -- so the
 cost is staleness that goes unreported, not a bad read. Both would be covered
 by a filesystem-wide `fanotify` mark, which needs `CAP_SYS_ADMIN`.
 
+#### Read leases
+
+**`XAL_WATCHMODE_READ_LEASE`**
+: `xal_index()` builds the tree without extents. `xal_extents_acquire()`
+  maps a file the first time it is asked for, while holding a read lease on
+  it (`F_SETLEASE`, `F_RDLCK`), as `xal_index()` maps it in
+  `XAL_WATCHMODE_NONE`, flags included; extents past the end of the file are
+  left out or cut at the block holding it. A writer that opens or truncates
+  the file then waits until every caller between `xal_extents_acquire()`
+  and `xal_extents_release()` is done; xal releases the lease, the writer
+  goes ahead, and the next `xal_extents_acquire()` maps the file again. A
+  file open for writing gets no lease, and `xal_extents_acquire()` returns
+  `-EAGAIN` for it. `xal_get_extents()` and `xal_walk()` report no extents
+  for a file until it has been acquired, nor after its lease is gone.
+
+Where `XAL_WATCHMODE_REFLINK_SNAPSHOT` lets writers go ahead and keeps the
+old data for readers, this mode makes writers wait for readers, and writes
+nothing to the filesystem itself. It needs:
+
+* the files to be owned by the caller, or `CAP_LEASE`, and
+  `/proc/sys/fs/leases-enable` to be 1
+* one file descriptor per mapped file, so `RLIMIT_NOFILE` bounds how many
+  files can be held at once
+* readers to release within `/proc/sys/fs/lease-break-time` seconds, after
+  which the kernel lets a waiting writer through anyway
+* the caller not to use `SIGRTMIN+7`, nor to rely on `SIGIO` sent to the
+  process, while a handle in this mode is open
+
+Breaks reach a thread of xal's as `SIGRTMIN+7`, or `SIGIO`, directed at it
+with `F_SETOWN_EX`; it blocks all signals and takes these with
+`sigtimedwait()`, so no signal disposition of the process changes. A writer
+that opens with `O_NONBLOCK`, as coreutils `truncate` does, does not wait:
+it gets `EWOULDBLOCK` while any lease is held on the file, and succeeds on a
+retry once xal has released it.
+
+The leases belong to the process that opened the handle; in a forked child
+`xal_extents_acquire()` and `xal_index()` return `-ECHILD`. A child made
+without the fork handlers, as by `clone()` or `_Fork()`, is not told apart
+and must not use or close the handle. `fork()` waits for xal's locks, so do
+not fork while holding a lock that a fork handler of the caller takes, nor
+from a signal handler while a handle in this mode is open. A file being
+mapped at `fork()` stays open in the child, even after `xal_close()` there,
+until it exits or execs.
+
+It does not support `shm_name`, and it does not see changes that do not open
+the file for writing: a dedupe through a read-only descriptor, data moved by
+the filesystem itself as zoned XFS garbage collection does, or writes to the
+block device. See `xal_extents_acquire()` in `include/libxal.h`.
+
 #### File lookup modes
 
 The path-based inode and extent lookup implementation depends on which
