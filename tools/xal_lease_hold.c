@@ -7,13 +7,16 @@
  * test check that a writer of <file> waits while the extents are held and that the extents still
  * hold the file's data meanwhile.
  *
- * Usage: xal_lease_hold <dev_uri> <mountpoint> <file>
+ * Usage: xal_lease_hold [--no-recheck]
  *                       [--probe | --shm | --thread | --fork | --orphan | --idle <file2>]
+ *                       <dev_uri> <mountpoint> <file>
  *
- * Without an option, prints once the extents are held:
+ * --no-recheck sets xal_opts.lease_no_recheck.
+ * Without a mode option, prints once the extents are held:
  *   LEASE_READY pid=<pid> byte=<device byte offset of the first extent> extents=<n>
- * then waits for SIGUSR1, releases the extents and prints RELEASED. It then acquires them again
- * every 50 ms until that succeeds, which it can once the writer has closed the file, and prints
+ * then waits for SIGUSR1, releases the extents and prints RELEASED err=<what xal_extents_release()
+ * returned>. It then acquires them again every 50 ms until that succeeds, which it can once the
+ * writer has closed the file, and prints
  *   REACQUIRED byte=<device byte offset of the first extent> extents=<n>
  * and waits for SIGTERM or SIGINT before closing.
  *
@@ -23,17 +26,19 @@
  *
  * --probe acquires once, prints ACQUIRE err=<err> and, on success, one line per extent:
  *   EXTENT <i> byte=<device byte offset> bytes=<length> flag=<flag>
- * then exits. --shm opens with a shm_name, prints OPEN err=<err> and exits. --fork acquires and
- * releases, forks a child that acquires, prints CHILD_ACQUIRE err=<err> and CHILD_STATS err=<what
- * xal_lease_stats() returned>, opens /dev/null 64 times, closes the handle and prints
- * CHILD_FDS=<how many of those are still open>/<how many it opened>, then prints PARENT_LEASE=<n>,
- * the number of leases on <file> listed in /proc/locks, and exits. --orphan acquires and releases,
- * forks a child that sleeps for 30 s, or until a signal, with the handle open, prints ORPHAN
- * child=<pid> once fork() has returned in the child, and exits without xal_close().
+ * then releases twice, printing RELEASE err=<err> and RELEASE_AGAIN err=<err>, and exits. --shm
+ * opens with a shm_name, prints OPEN err=<err> and exits. --fork acquires and releases, forks a
+ * child that acquires, prints CHILD_ACQUIRE err=<err> and CHILD_STATS err=<what xal_lease_stats()
+ * returned>, opens /dev/null 64 times, closes the handle and prints CHILD_FDS=<how many of those
+ * are still open>/<how many it opened>, then prints PARENT_LEASE=<n>, the number of leases on
+ * <file> listed in /proc/locks, and exits. --orphan acquires and releases, forks a child that
+ * sleeps for 30 s, or until a signal, with the handle open, prints ORPHAN child=<pid> once fork()
+ * has returned in the child, and exits without xal_close().
  */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <getopt.h>
 #include <inttypes.h>
 #include <pthread.h>
 #include <signal.h>
@@ -90,7 +95,8 @@ probe(struct xal *xal, struct xal_inode *inode)
 		printf("EXTENT %u byte=%" PRIu64 " bytes=%" PRIu64 " flag=0x%02x\n", i,
 		       extent->start_block * blocksize, extent->nblocks * blocksize, extent->flag);
 	}
-	xal_extents_release(xal, inode);
+	printf("RELEASE err=%d\n", xal_extents_release(xal, inode));
+	printf("RELEASE_AGAIN err=%d\n", xal_extents_release(xal, inode));
 
 	return 0;
 }
@@ -267,8 +273,8 @@ hold(struct xal *xal, struct xal_inode *inode, struct xal_inode *idle, bool on_t
 	while (!g_release && !g_stop) {
 		sigsuspend(orig);
 	}
-	xal_extents_release(xal, inode);
-	printf("RELEASED\n");
+	err = xal_extents_release(xal, inode);
+	printf("RELEASED err=%d\n", err);
 	fflush(stdout);
 
 	for (int i = 0; i < 600 && !g_stop; ++i) {
@@ -296,25 +302,43 @@ hold(struct xal *xal, struct xal_inode *inode, struct xal_inode *idle, bool on_t
 int
 main(int argc, char *argv[])
 {
+	static const struct option longopts[] = {
+	    {"probe", no_argument, NULL, 'p'},	    {"shm", no_argument, NULL, 's'},
+	    {"thread", no_argument, NULL, 't'},	    {"fork", no_argument, NULL, 'f'},
+	    {"orphan", no_argument, NULL, 'o'},	    {"idle", required_argument, NULL, 'i'},
+	    {"no-recheck", no_argument, NULL, 'r'}, {NULL, 0, NULL, 0},
+	};
 	struct xal_opts opts = {0};
 	struct sigaction sa = {0};
 	sigset_t block, orig;
 	struct xal_inode *inode, *idle = NULL;
+	char *idle_path = NULL;
 	struct xal *xal;
-	const char *option = argc >= 5 ? argv[4] : "";
-	int err, ret;
+	int c, mode = 0, err, ret;
 
-	if (argc < 4 || argc > 6 ||
-	    (argc == 5 && strcmp(option, "--probe") && strcmp(option, "--shm") &&
-	     strcmp(option, "--thread") && strcmp(option, "--fork") &&
-	     strcmp(option, "--orphan")) ||
-	    (argc == 6 && strcmp(option, "--idle"))) {
+	while ((c = getopt_long(argc, argv, "", longopts, NULL)) != -1) {
+		if (c == 'r') {
+			opts.lease_no_recheck = 1;
+			continue;
+		}
+		if (c == '?' || mode) {
+			mode = '?';
+			break;
+		}
+		mode = c;
+		if (c == 'i') {
+			idle_path = optarg;
+		}
+	}
+	if (mode == '?' || argc - optind != 3) {
 		fprintf(stderr,
-			"Usage: %s <dev_uri> <mountpoint> <file> "
-			"[--probe | --shm | --thread | --fork | --orphan | --idle <file2>]\n",
+			"Usage: %s [--no-recheck] "
+			"[--probe | --shm | --thread | --fork | --orphan | --idle <file2>] "
+			"<dev_uri> <mountpoint> <file>\n",
 			argv[0]);
 		return 2;
 	}
+	argv += optind;
 
 	// Blocked so that only hold(), where it waits for them, and orphan()'s child take these
 	sa.sa_handler = on_signal;
@@ -330,13 +354,13 @@ main(int argc, char *argv[])
 
 	opts.be = XAL_BACKEND_FIEMAP;
 	opts.watch_mode = XAL_WATCHMODE_READ_LEASE;
-	opts.mountpoint = argv[2];
-	if (!strcmp(option, "--shm")) {
+	opts.mountpoint = argv[1];
+	if (mode == 's') {
 		opts.shm_name = "/xal_lease_hold_test";
 	}
 
-	err = xal_open_from_uri(argv[1], &xal, &opts);
-	if (!strcmp(option, "--shm")) {
+	err = xal_open_from_uri(argv[0], &xal, &opts);
+	if (mode == 's') {
 		printf("OPEN err=%d\n", err);
 		if (!err) {
 			xal_close(xal);
@@ -350,10 +374,10 @@ main(int argc, char *argv[])
 
 	err = xal_index(xal);
 	if (!err) {
-		err = xal_get_inode(xal, argv[3], &inode);
+		err = xal_get_inode(xal, argv[2], &inode);
 	}
-	if (!err && argc == 6) {
-		err = xal_get_inode(xal, argv[5], &idle);
+	if (!err && idle_path) {
+		err = xal_get_inode(xal, idle_path, &idle);
 	}
 	if (err) {
 		fprintf(stderr, "FAILED: xal_index() or xal_get_inode(); err(%d)\n", err);
@@ -361,14 +385,14 @@ main(int argc, char *argv[])
 		return 1;
 	}
 
-	if (!strcmp(option, "--probe")) {
+	if (mode == 'p') {
 		ret = probe(xal, inode);
-	} else if (!strcmp(option, "--fork")) {
+	} else if (mode == 'f') {
 		ret = fork_probe(xal, inode);
-	} else if (!strcmp(option, "--orphan")) {
+	} else if (mode == 'o') {
 		ret = orphan(xal, inode);
 	} else {
-		ret = hold(xal, inode, idle, !strcmp(option, "--thread"), &orig);
+		ret = hold(xal, inode, idle, mode == 't', &orig);
 	}
 
 	xal_close(xal);

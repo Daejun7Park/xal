@@ -646,7 +646,7 @@ xal_be_fiemap_open(struct xal **xal, char *mountpoint, struct xal_opts *opts)
 			goto failed;
 		}
 
-		err = xal_be_fiemap_lease_init(cand, be->mountpoint);
+		err = xal_be_fiemap_lease_init(cand, be->mountpoint, opts);
 		if (err) {
 			XAL_DEBUG("FAILED: xal_be_fiemap_lease_init(); err(%d)", err);
 			goto failed;
