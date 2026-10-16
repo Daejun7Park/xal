@@ -122,7 +122,10 @@ nothing to the filesystem itself. It needs:
 * readers to release within `/proc/sys/fs/lease-break-time` seconds, after
   which the kernel lets a waiting writer through anyway; a later
   `xal_extents_release()` returns `-ESTALE` once xal's thread has taken the
-  break
+  break. A reader that holds the extents for long can poll
+  `xal_extents_recalled()`, which takes no lock, and release once a writer
+  waits. A `lease-break-time` of 0 makes the kernel wait for readers however
+  long they take, for every lease on the system
 * the caller not to use `SIGRTMIN+7`, nor to rely on `SIGIO` sent to the
   process, while a handle in this mode is open
 

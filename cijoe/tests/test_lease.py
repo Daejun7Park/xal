@@ -16,6 +16,7 @@ import pytest
 
 READY_RE = re.compile(r"LEASE_READY pid=(\d+) byte=(\d+) extents=(\d+)")
 RELEASED_RE = re.compile(r"RELEASED err=(-?\d+)")
+RECALLED_RE = re.compile(r"RECALLED left_ms=(-?\d+)")
 REACQUIRED_RE = re.compile(r"REACQUIRED byte=(\d+) extents=(\d+)")
 EXTENT_RE = re.compile(r"EXTENT 0 byte=(\d+) bytes=(\d+) flag=0x([0-9a-f]+)")
 SWEEP_RE = re.compile(
@@ -506,6 +507,81 @@ def test_lease_recheck_ignores_shared_split(cijoe):
         _stop_hold(cijoe, pid)
 
     cijoe.run(f"sudo rm -f {held} {other}")
+
+
+def _recall(cijoe, name):
+    """Hold a file with --poll and open it for writing; return (left_ms, took_ms) once the
+    reader has seen the recall, released, and the writer is done."""
+
+    dev_path, mountpoint = _require_fixture(cijoe)
+    path = f"{mountpoint}/{name}"
+    _fill(cijoe, path, "A", 4096)
+
+    pid, _, log = _start_hold(cijoe, dev_path, mountpoint, path, "--poll")
+    try:
+        writer = _timed(
+            cijoe, "lease_writer", f"printf B | dd of={path} conv=notrunc,fsync status=none"
+        )
+        left = int(_wait_for(log, RECALLED_RE, 10).group(1))
+        took = int(_wait_for(writer, TOOK_RE, 10).group(1))
+        assert int(_wait_for(log, RELEASED_RE, 10).group(1)) == 0, "release after recall stale"
+
+        m = _wait_for(log, REACQUIRED_RE, 30)
+        assert _raw(cijoe, dev_path, int(m.group(1)), 1) == "B", "remapped extent lacks the write"
+    finally:
+        _stop_hold(cijoe, pid)
+
+    cijoe.run(f"rm -f {path}")
+    return left, took
+
+
+def test_lease_reader_sees_recall(cijoe):
+    """A reader polling xal_extents_recalled() learns that a writer waits and how long is left
+    of lease-break-time, and by releasing lets the writer go ahead at once."""
+
+    breaktime = int(_capture(cijoe, "cat /proc/sys/fs/lease-break-time"))
+    if breaktime <= 0:
+        pytest.skip("lease-break-time is 0, see test_lease_recall_without_break_time")
+
+    left, took = _recall(cijoe, "xal_lease_recall")
+    assert (breaktime - 2) * 1000 < left < breaktime * 1000, f"{left} ms left of {breaktime} s"
+    assert took < 1000, f"writer took {took} ms although the reader released on the recall"
+
+
+def test_lease_recall_without_break_time(cijoe):
+    """With a lease-break-time of 0 the kernel waits for readers however long they take, which
+    the recall reports as no time limit."""
+
+    cijoe.run("sudo sysctl -qw fs.lease-break-time=0")
+    left, _ = _recall(cijoe, "xal_lease_recall_nolimit")
+    assert left == -1, f"{left} ms left reported with a lease-break-time of 0"
+
+
+def test_lease_recall_after_stale_release(cijoe):
+    """Once a release has found the extents stale, the other readers are told to release now:
+    left_ms is 0, which only the stale flag gives. Their release says the extents are stale too."""
+
+    dev_path, mountpoint = _require_fixture(cijoe)
+    held, twin = f"{mountpoint}/xal_lease_stale_recall", f"{mountpoint}/xal_lease_stale_twin"
+    _fill(cijoe, held, "E", 65536)
+    _fill(cijoe, twin, "E", 65536)
+
+    pid, _, log = _start_hold(cijoe, dev_path, mountpoint, held, "--twice")
+    try:
+        out = _capture(cijoe, f"sudo xfs_io -r -c 'dedupe {twin} 0 0 65536' {held}")
+        assert "deduped 65536/65536" in out, f"dedupe did not go through:\n{out}"
+
+        cijoe.run(f"sudo kill -USR1 {pid}")
+        assert int(_wait_for(log, RELEASED_RE, 10).group(1)) == -ESTALE, log.read_text()
+        assert int(_wait_for(log, RECALLED_RE, 10).group(1)) == 0, log.read_text()
+
+        cijoe.run(f"sudo kill -USR1 {pid}")
+        m = _wait_for(log, re.compile(r"RELEASED_OTHER err=(-?\d+)"), 10)
+        assert int(m.group(1)) == -ESTALE, log.read_text()
+    finally:
+        _stop_hold(cijoe, pid)
+
+    cijoe.run(f"rm -f {held} {twin}")
 
 
 def _sweep(cijoe, name, nfiles, options="", nofile=None):

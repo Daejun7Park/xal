@@ -1037,6 +1037,48 @@ xal_extents_release(struct xal *xal, struct xal_inode *inode)
 }
 
 int
+xal_extents_recalled(struct xal *xal, struct xal_inode *inode, uint64_t *left_ns)
+{
+	struct xal_lease_set *ls;
+	struct xal_lease_entry *e;
+	uint64_t expire_ns, now;
+	uint32_t idx;
+
+	if (left_ns) {
+		*left_ns = 0;
+	}
+	if (!xal || !inode) {
+		return -EINVAL;
+	}
+
+	ls = lease_set(xal);
+	if (!ls) {
+		return 0;
+	}
+	if (lease_foreign(ls)) {
+		return -ECHILD;
+	}
+
+	idx = xal_inode_idx(xal, inode);
+	if (idx >= ls->nentries) {
+		return -EINVAL;
+	}
+	e = &ls->entries[idx];
+
+	/* lease_revoke() sets expire_ns before REVOKING */
+	if (atomic_load(&e->state) != XAL_LEASE_REVOKING) {
+		return 0;
+	}
+	if (left_ns && !atomic_load(&e->stale)) {
+		expire_ns = atomic_load(&e->expire_ns);
+		now = now_ns();
+		*left_ns = !expire_ns ? UINT64_MAX : expire_ns > now ? expire_ns - now : 0;
+	}
+
+	return 1;
+}
+
+int
 xal_lease_stats(struct xal *xal, struct xal_lease_stats *stats)
 {
 	struct xal_lease_set *ls;
