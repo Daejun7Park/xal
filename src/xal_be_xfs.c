@@ -692,7 +692,7 @@ retrieve_and_decode_primary_superblock(struct xnvme_dev *dev, void *buf, struct 
 	err = dev_read(dev, buf, 4096, 0);
 	if (err) {
 		XAL_DEBUG("FAILED: dev_read()\n");
-		return -errno;
+		return err;
 	}
 
 	cand = calloc(1, sizeof(*cand));
@@ -753,7 +753,7 @@ xal_be_xfs_open(struct xnvme_dev *dev, struct xal **xal, struct xal_opts *opts)
 	if (err) {
 		XAL_DEBUG("FAILED: retrieve_and_decode_primary_superblock()");
 		xnvme_buf_free(dev, buf);
-		return -errno;
+		return err;
 	}
 
 	be = (struct xal_be_xfs *)&cand->be;
