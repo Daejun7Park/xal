@@ -129,8 +129,10 @@ old data for readers, this mode makes writers wait for readers, and writes
 nothing to the filesystem itself. It needs:
 
 * the files to be owned by the caller, or `CAP_LEASE`
-* one file descriptor per mapped file, so `RLIMIT_NOFILE` bounds how many
-  files can be held at once
+* one file descriptor per file under a lease. Past `xal_opts.lease_max`, by
+  default half the soft `RLIMIT_NOFILE`, or when out of descriptors, xal
+  drops the lease of a file without readers that was not acquired since the
+  last pass, and maps it again on its next `xal_extents_acquire()`
 * readers to release within `/proc/sys/fs/lease-break-time` seconds, after
   which the kernel lets a waiting writer through anyway; a later
   `xal_extents_release()` returns `-ESTALE` once xal's thread has taken the

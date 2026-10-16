@@ -18,6 +18,9 @@ READY_RE = re.compile(r"LEASE_READY pid=(\d+) byte=(\d+) extents=(\d+)")
 RELEASED_RE = re.compile(r"RELEASED err=(-?\d+)")
 REACQUIRED_RE = re.compile(r"REACQUIRED byte=(\d+) extents=(\d+)")
 EXTENT_RE = re.compile(r"EXTENT 0 byte=(\d+) bytes=(\d+) flag=0x([0-9a-f]+)")
+SWEEP_RE = re.compile(
+    r"SWEEP files=(\d+) failed=(\d+) err=(-?\d+) leases=(-?\d+) evicted=(\d+)"
+)
 
 XAL_EXTENT_SHARED = 0x2  # enum xal_extent_flag
 FMR_OWN_FREE = "special_0:1"
@@ -503,6 +506,106 @@ def test_lease_recheck_ignores_shared_split(cijoe):
         _stop_hold(cijoe, pid)
 
     cijoe.run(f"sudo rm -f {held} {other}")
+
+
+def _sweep(cijoe, name, nfiles, options="", nofile=None):
+    """Make nfiles files under a directory, acquire and release each; return the SWEEP counts."""
+
+    dev_path, mountpoint = _require_fixture(cijoe)
+    directory = f"{mountpoint}/{name}"
+    cijoe.run(f"mkdir -p {directory}")
+    cijoe.run(f"sh -c 'for i in $(seq {nfiles}); do printf A > {directory}/f$i; done; sync'")
+    limit = f"ulimit -n {nofile} && " if nofile else ""
+    out = _capture(
+        cijoe,
+        f"sudo sh -c '{limit}xal_lease_hold {options} --sweep {dev_path} {mountpoint} {directory}'",
+    )
+    cijoe.run(f"rm -rf {directory}")
+    m = SWEEP_RE.search(out)
+    assert m, f"no sweep result:\n{out}"
+    return dict(zip(("files", "failed", "err", "leases", "evicted"), map(int, m.groups())))
+
+
+def test_lease_drops_idle_past_lease_max(cijoe):
+    """Past lease_max, xal drops the leases of files without readers instead of holding more."""
+
+    r = _sweep(cijoe, "xal_lease_sweep", 10, "--max 4")
+    assert r["files"] == 10 and r["failed"] == 0, r
+    assert r["leases"] <= 4, f"more leases held than lease_max: {r}"
+    assert r["evicted"] == 6, r
+
+
+def test_lease_drops_idle_at_nofile_limit(cijoe):
+    """By default xal keeps leases on at most half the soft RLIMIT_NOFILE, so mapping more files
+    than there are descriptors does not fail."""
+
+    r = _sweep(cijoe, "xal_lease_nofile", 200, nofile=64)
+    assert r["files"] == 200, r
+    assert r["failed"] == 0, f"mapping failed past the descriptor limit: {r}"
+    assert r["leases"] <= 32, f"more leases held than half of RLIMIT_NOFILE: {r}"
+
+
+def test_lease_drops_idle_when_out_of_descriptors(cijoe):
+    """With lease_max above RLIMIT_NOFILE, xal drops a lease when open() runs out of descriptors
+    instead of failing the mapping."""
+
+    r = _sweep(cijoe, "xal_lease_emfile", 200, "--max 1000", nofile=64)
+    assert r["files"] == 200, r
+    assert r["failed"] == 0, f"mapping failed when out of descriptors: {r}"
+    assert r["evicted"] > 0, r
+
+
+def _release_with_no_descriptor_free(cijoe, name, options, breaktime_at_open):
+    """Hold a file under ulimit -n 64 with options that leave no descriptor free, let a writer
+    through with a lease-break-time of 1 s, and return what the release said."""
+
+    dev_path, mountpoint = _require_fixture(cijoe)
+    path = f"{mountpoint}/{name}"
+    fill = f"{mountpoint}/{name}_fill"
+    _fill(cijoe, path, "A", 4096)
+    cijoe.run(f"mkdir -p {fill}")
+    cijoe.run(f"sh -c 'for i in $(seq 100); do printf A > {fill}/f$i; done; sync'")
+
+    cijoe.run(f"sudo sysctl -qw fs.lease-break-time={breaktime_at_open}")
+    log = _artifacts(cijoe) / "lease_hold.log"
+    cijoe.run(f"sudo rm -f {log}")
+    cijoe.run(
+        f"sudo sh -c 'ulimit -n 64 && nohup xal_lease_hold {options.format(fill=fill)} "
+        f"{dev_path} {mountpoint} {path} > {log} 2>&1 & echo backgrounded'"
+    )
+    pid = int(_wait_for(log, READY_RE, 30).group(1))
+    try:
+        cijoe.run("sudo sysctl -qw fs.lease-break-time=1")
+        writer = _timed(
+            cijoe, "lease_writer", f"printf B | dd of={path} conv=notrunc,fsync status=none"
+        )
+        _wait_for(writer, TOOK_RE, 10)
+
+        cijoe.run(f"sudo kill -USR1 {pid}")
+        err = int(_wait_for(log, RELEASED_RE, 10).group(1))
+    finally:
+        _stop_hold(cijoe, pid)
+
+    cijoe.run(f"rm -rf {path} {fill}")
+    return err
+
+
+def test_lease_release_stale_with_no_descriptor_free(cijoe):
+    """With every descriptor taken by idle leases, as lease_max above RLIMIT_NOFILE allows, the
+    release drops one to read fdinfo. The handle opens at lease-break-time 45, which is set to 1
+    after LEASE_READY; xal cannot read it at the break, so it still goes by 45 s, and only fdinfo
+    can tell."""
+
+    err = _release_with_no_descriptor_free(cijoe, "xal_lease_nofd", "--max 1000 --idle {fill}", 45)
+    assert err == -ESTALE, f"release returned {err} with no descriptor free"
+
+
+def test_lease_release_stale_with_no_descriptor_to_drop(cijoe):
+    """With every descriptor taken and no idle lease to drop, the release cannot read fdinfo and
+    goes by the lease-break-time read when the handle opened, not by 45 s."""
+
+    err = _release_with_no_descriptor_free(cijoe, "xal_lease_nofd_none", "--exhaust", 1)
+    assert err == -ESTALE, f"release returned {err} with no descriptor to drop"
 
 
 def test_lease_rejects_shm(cijoe):
