@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -125,7 +126,7 @@ lease_atfork_prepare(void)
 {
 	pthread_mutex_lock(&lease_proc.lifecycle);
 	pthread_mutex_lock(&lease_proc.lock);
-	/* So that a child finds no entries[] or e->fd being changed */
+	/* So that a child finds no held[] or close queue being changed */
 	for (struct xal_lease_set *ls = lease_proc.sets; ls; ls = ls->next) {
 		pthread_mutex_lock(&ls->lock);
 	}
@@ -155,14 +156,13 @@ lease_atfork_child(void)
 	 * the parent's exit. Closed without F_UNLCK, which would drop them for the parent too.
 	 */
 	for (struct xal_lease_set *ls = lease_proc.sets; ls; ls = ls->next) {
-		for (size_t i = 0; i < ls->nentries; ++i) {
-			struct xal_lease_entry *e = &ls->entries[i];
+		for (uint32_t i = 0; i < ls->nheld; ++i) {
+			struct xal_lease_entry *e = &ls->entries[ls->held[i]];
 
-			if (e->fd >= 0) {
-				close(e->fd);
-				e->fd = -1;
-			}
+			close(e->fd);
+			e->fd = -1;
 		}
+		ls->nheld = 0;
 	}
 	lease_atfork_unlock_sets();
 	lease_generation++;
@@ -228,19 +228,27 @@ ext_vec_push(struct ext_vec *vec, const struct fiemap_extent *fe, uint32_t block
 	return 0;
 }
 
-/* Called with ls->lock held */
+static void
+lease_close(int fd)
+{
+	if (fcntl(fd, F_SETLEASE, F_UNLCK)) {
+		XAL_DEBUG("FAILED: F_SETLEASE(F_UNLCK); errno(%d)", errno);
+	}
+	close(fd);
+}
+
+/*
+ * Called with ls->lock held. Forgets the lease of e; its descriptor is closed by lease_unlock(),
+ * after ls->lock is released, and a break that comes meanwhile finds no entry in fd_map.
+ */
 static void
 lease_drop(struct xal_lease_set *ls, struct xal_lease_entry *e)
 {
+	uint32_t last;
 	khiter_t it;
 
 	if (e->fd < 0) {
 		return;
-	}
-
-	/* In a forked child the lease is the parent's, which still counts on it */
-	if (!lease_foreign(ls) && fcntl(e->fd, F_SETLEASE, F_UNLCK)) {
-		XAL_DEBUG("FAILED: F_SETLEASE(F_UNLCK); errno(%d)", errno);
 	}
 
 	it = kh_get(fd_to_idx, ls->fd_map, e->fd);
@@ -248,8 +256,44 @@ lease_drop(struct xal_lease_set *ls, struct xal_lease_entry *e)
 		kh_del(fd_to_idx, ls->fd_map, it);
 	}
 
-	close(e->fd);
+	if (ls->ndead == ls->dead_cap) {
+		uint32_t cap = ls->dead_cap ? ls->dead_cap * 2 : 16;
+		int *dead = realloc(ls->dead, cap * sizeof(*dead));
+
+		if (dead) {
+			ls->dead = dead;
+			ls->dead_cap = cap;
+		}
+	}
+	if (ls->ndead < ls->dead_cap) {
+		ls->dead[ls->ndead++] = e->fd;
+	} else {
+		lease_close(e->fd);
+	}
 	e->fd = -1;
+
+	/* The last held entry takes this one's slot */
+	last = ls->held[--ls->nheld];
+	ls->held[e->slot] = last;
+	ls->entries[last].slot = e->slot;
+}
+
+/* Releases ls->lock, then closes the descriptors lease_drop() set aside */
+static void
+lease_unlock(struct xal_lease_set *ls)
+{
+	uint32_t ndead = ls->ndead;
+	int *dead = ls->dead;
+
+	ls->dead = NULL;
+	ls->ndead = 0;
+	ls->dead_cap = 0;
+	pthread_mutex_unlock(&ls->lock);
+
+	for (uint32_t i = 0; i < ndead; ++i) {
+		lease_close(dead[i]);
+	}
+	free(dead);
 }
 
 /*
@@ -269,6 +313,46 @@ lease_finish_revoke(struct xal_lease_set *ls, uint32_t idx)
 	xal_inode_at(ls->xal, idx)->content.extents.count = 0;
 	atomic_store(&e->state, XAL_LEASE_REVOKED);
 	ls->stats.revoked++;
+}
+
+/*
+ * Called with ls->lock held. Drops the lease of one file without readers, passing over those
+ * acquired since the hand last went by, as CLOCK does. Returns whether it dropped one.
+ */
+static bool
+lease_evict_one(struct xal_lease_set *ls)
+{
+	for (uint32_t n = 0; n < 2 * ls->nheld; ++n) {
+		uint32_t pos = ls->hand < ls->nheld ? ls->hand : 0;
+		uint32_t idx = ls->held[pos];
+		struct xal_lease_entry *e = &ls->entries[idx];
+		int expected = XAL_LEASE_VALID;
+
+		ls->hand = pos + 1;
+		if (atomic_load(&e->state) != XAL_LEASE_VALID || atomic_load(&e->readers) ||
+		    atomic_exchange(&e->ref, false)) {
+			continue;
+		}
+		if (!atomic_compare_exchange_strong(&e->state, &expected, XAL_LEASE_EVICTING)) {
+			continue;
+		}
+		/* Pairs with xal_extents_acquire(): a reader counted first keeps the mapping */
+		if (atomic_load(&e->readers)) {
+			atomic_store(&e->state, XAL_LEASE_VALID);
+			continue;
+		}
+
+		/* The last held entry moves into pos, so the hand looks at it next */
+		lease_drop(ls, e);
+		ls->hand = pos;
+		xal_inode_at(ls->xal, idx)->content.extents.count = 0;
+		atomic_store(&e->state, XAL_LEASE_UNMAPPED);
+		ls->stats.evicted++;
+
+		return true;
+	}
+
+	return false;
 }
 
 /*
@@ -293,7 +377,10 @@ lease_revoke(struct xal_lease_set *ls, uint32_t idx, uint64_t expire_ns)
 	}
 }
 
-/* Revoke the lease held on fd, if this set holds it */
+/*
+ * Revoke the lease held on fd, if this set holds it. A dropped lease's fd may have been reused for
+ * another file's by the time its break is taken, so the lease must be the one being broken.
+ */
 static bool
 lease_break(struct xal_lease_set *ls, int fd, uint64_t expire_ns)
 {
@@ -303,11 +390,11 @@ lease_break(struct xal_lease_set *ls, int fd, uint64_t expire_ns)
 	pthread_mutex_lock(&ls->lock);
 	it = kh_get(fd_to_idx, ls->fd_map, fd);
 	found = it != kh_end(ls->fd_map);
-	if (found) {
+	if (found && fcntl(fd, F_GETLEASE) != F_RDLCK) {
 		ls->stats.breaks++;
 		lease_revoke(ls, kh_val(ls->fd_map, it), expire_ns);
 	}
-	pthread_mutex_unlock(&ls->lock);
+	lease_unlock(ls);
 
 	return found;
 }
@@ -319,17 +406,19 @@ lease_rescan(struct xal_lease_set *ls, uint64_t expire_ns)
 	pthread_mutex_lock(&ls->lock);
 	ls->stats.rescans++;
 
-	for (uint32_t i = 0; i < ls->nentries; ++i) {
-		struct xal_lease_entry *e = &ls->entries[i];
+	/* Backwards, as a revoke that drops a lease moves the last held entry into its slot */
+	for (uint32_t i = ls->nheld; i-- > 0;) {
+		uint32_t idx = ls->held[i];
+		struct xal_lease_entry *e = &ls->entries[idx];
 
 		/* A lease being broken reports the type it is breaking to, F_UNLCK here. */
-		if (e->fd >= 0 && atomic_load(&e->state) == XAL_LEASE_VALID &&
+		if (atomic_load(&e->state) == XAL_LEASE_VALID &&
 		    fcntl(e->fd, F_GETLEASE) != F_RDLCK) {
-			lease_revoke(ls, i, expire_ns);
+			lease_revoke(ls, idx, expire_ns);
 		}
 	}
 
-	pthread_mutex_unlock(&ls->lock);
+	lease_unlock(ls);
 }
 
 /*
@@ -570,10 +659,31 @@ lease_and_map(struct xal_lease_set *ls, struct xal_inode *inode, uint32_t idx)
 		return err;
 	}
 
-	/* O_NONBLOCK: a write lease held by someone else fails the open instead of blocking it. */
-	fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
-	if (fd < 0) {
-		return (errno == ENOENT || errno == ELOOP) ? -ESTALE : -errno;
+	pthread_mutex_lock(&ls->lock);
+	if (ls->nheld >= ls->max_held) {
+		lease_evict_one(ls);
+	}
+	lease_unlock(ls);
+
+	for (;;) {
+		bool evicted;
+
+		/* O_NONBLOCK: a write lease held by someone else fails the open, not blocks it */
+		fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+		if (fd >= 0) {
+			break;
+		}
+		err = -errno;
+		if (err != -EMFILE && err != -ENFILE) {
+			return (err == -ENOENT || err == -ELOOP) ? -ESTALE : err;
+		}
+
+		pthread_mutex_lock(&ls->lock);
+		evicted = lease_evict_one(ls);
+		lease_unlock(ls);
+		if (!evicted) {
+			return err;
+		}
 	}
 
 	if (fstat(fd, &st)) {
@@ -595,7 +705,7 @@ lease_and_map(struct xal_lease_set *ls, struct xal_inode *inode, uint32_t idx)
 		if (err == -EAGAIN) {
 			pthread_mutex_lock(&ls->lock);
 			ls->stats.unsealed++;
-			pthread_mutex_unlock(&ls->lock);
+			lease_unlock(ls);
 		}
 		goto failed;
 	}
@@ -613,22 +723,41 @@ lease_and_map(struct xal_lease_set *ls, struct xal_inode *inode, uint32_t idx)
 
 	pthread_mutex_lock(&ls->lock);
 
+	if (ls->nheld == ls->held_cap) {
+		uint32_t cap = ls->held_cap ? ls->held_cap * 2 : 64;
+		uint32_t *held = realloc(ls->held, cap * sizeof(*held));
+
+		if (!held) {
+			lease_unlock(ls);
+			err = -ENOMEM;
+			goto failed_unlock;
+		}
+		ls->held = held;
+		ls->held_cap = cap;
+	}
+
 	/* No reader is on the old extents, so their region is reused if it is large enough */
 	extent_idx = inode->content.extents.extent_idx;
 	if (vec.n > e->extent_cap) {
-		err = xal_pool_claim_extents(&ls->xal->extents, vec.n, &extent_idx);
+		uint32_t cap = 1;
+
+		/* Rounded up, as a file mapped again after an eviction may have grown */
+		while (cap < vec.n) {
+			cap <<= 1;
+		}
+		err = xal_pool_claim_extents(&ls->xal->extents, cap, &extent_idx);
 		if (err) {
-			pthread_mutex_unlock(&ls->lock);
+			lease_unlock(ls);
 			goto failed_unlock;
 		}
 		/* Together, so that a mapping failing below leaves the cap with its region */
 		inode->content.extents.extent_idx = extent_idx;
-		e->extent_cap = vec.n;
+		e->extent_cap = cap;
 	}
 
 	it = kh_put(fd_to_idx, ls->fd_map, fd, &ret);
 	if (ret < 0) {
-		pthread_mutex_unlock(&ls->lock);
+		lease_unlock(ls);
 		err = -ENOMEM;
 		goto failed_unlock;
 	}
@@ -641,7 +770,7 @@ lease_and_map(struct xal_lease_set *ls, struct xal_inode *inode, uint32_t idx)
 	 */
 	if (fcntl(fd, F_GETLEASE) != F_RDLCK) {
 		kh_del(fd_to_idx, ls->fd_map, it);
-		pthread_mutex_unlock(&ls->lock);
+		lease_unlock(ls);
 		err = -EAGAIN;
 		goto failed_unlock;
 	}
@@ -654,12 +783,14 @@ lease_and_map(struct xal_lease_set *ls, struct xal_inode *inode, uint32_t idx)
 	inode->size = st.st_size;
 
 	e->fd = fd;
+	e->slot = ls->nheld;
+	ls->held[ls->nheld++] = idx;
 	atomic_store(&e->expire_ns, 0);
 	atomic_store(&e->stale, false);
 	ls->stats.mapped++;
 	atomic_store(&e->state, XAL_LEASE_VALID);
 
-	pthread_mutex_unlock(&ls->lock);
+	lease_unlock(ls);
 
 	free(vec.v);
 
@@ -699,7 +830,7 @@ lease_reader_put(struct xal_lease_set *ls, uint32_t idx)
 	if (readers == 1 && atomic_load(&e->state) == XAL_LEASE_REVOKING) {
 		pthread_mutex_lock(&ls->lock);
 		lease_finish_revoke(ls, idx);
-		pthread_mutex_unlock(&ls->lock);
+		lease_unlock(ls);
 	}
 
 	return 0;
@@ -710,16 +841,33 @@ lease_reader_put(struct xal_lease_set *ls, uint32_t idx)
  * tell. A broken lease stays listed, as BREAKING, until the kernel lets the breaker through.
  */
 static int
-lease_held(int fd)
+lease_held(struct xal_lease_set *ls, int fd)
 {
 	char path[64], line[256];
 	bool held = false;
 	FILE *f;
 
 	snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", fd);
-	f = fopen(path, "re");
-	if (!f) {
-		return -errno;
+	for (;;) {
+		int err;
+		bool evicted;
+
+		f = fopen(path, "re");
+		if (f) {
+			break;
+		}
+		err = -errno;
+		if (err != -EMFILE && err != -ENFILE) {
+			return err;
+		}
+
+		/* With every descriptor taken, as past lease_max, the clock would decide instead */
+		pthread_mutex_lock(&ls->lock);
+		evicted = lease_evict_one(ls);
+		lease_unlock(ls);
+		if (!evicted) {
+			return err;
+		}
 	}
 	while (!held && fgets(line, sizeof(line), f)) {
 		held = !strncmp(line, "lock:", 5) && strstr(line, " LEASE ");
@@ -747,7 +895,7 @@ lease_check(struct xal_lease_set *ls, struct xal_inode *inode, struct xal_lease_
 		return -ESTALE;
 	}
 	if (atomic_load(&e->state) == XAL_LEASE_REVOKING) {
-		err = lease_held(e->fd);
+		err = lease_held(ls, e->fd);
 		expire_ns = atomic_load(&e->expire_ns);
 		if (!err || (err < 0 && expire_ns && now_ns() >= expire_ns)) {
 			return -ESTALE;
@@ -808,6 +956,7 @@ xal_extents_acquire(struct xal *xal, struct xal_inode *inode, struct xal_extents
 		/* Pairs with lease_revoke(), which sets REVOKING, then drops at 0 readers */
 		atomic_fetch_add(&e->readers, 1);
 		if (atomic_load(&e->state) == XAL_LEASE_VALID) {
+			atomic_store(&e->ref, true);
 			*extents = &inode->content.extents;
 			return 0;
 		}
@@ -820,6 +969,7 @@ xal_extents_acquire(struct xal *xal, struct xal_inode *inode, struct xal_extents
 		case XAL_LEASE_REVOKING:
 			return -EAGAIN;
 		case XAL_LEASE_MAPPING:
+		case XAL_LEASE_EVICTING:
 			nanosleep(&lease_nap, NULL);
 			continue;
 		default:
@@ -878,7 +1028,7 @@ xal_extents_release(struct xal *xal, struct xal_inode *inode)
 		/* Other readers are told too, and the next acquire maps the file again */
 		atomic_store(&ls->entries[idx].stale, true);
 		lease_revoke(ls, idx, 0);
-		pthread_mutex_unlock(&ls->lock);
+		lease_unlock(ls);
 	}
 
 	put = lease_reader_put(ls, idx);
@@ -902,7 +1052,7 @@ xal_lease_stats(struct xal *xal, struct xal_lease_stats *stats)
 
 	pthread_mutex_lock(&ls->lock);
 	*stats = ls->stats;
-	pthread_mutex_unlock(&ls->lock);
+	lease_unlock(ls);
 
 	return 0;
 }
@@ -918,25 +1068,34 @@ xal_be_fiemap_lease_reset(struct xal *xal, bool force)
 
 	/*
 	 * lease_atfork_child() closed the descriptors of every set listed at fork(). What is still
-	 * open here belongs to a set that another thread was closing then; it is closed without
-	 * F_UNLCK, which would drop the parent's leases, and without ls->lock, which that thread
-	 * may have held.
+	 * open here, in the entries or in dead[], belongs to a set that another thread was closing
+	 * then; it is closed without F_UNLCK, which would drop the parent's leases, and without
+	 * ls->lock, which that thread may have held.
 	 */
 	if (lease_foreign(ls)) {
 		if (!force) {
 			return -ECHILD;
 		}
 		for (uint32_t i = 0; i < ls->nentries; ++i) {
-			lease_drop(ls, &ls->entries[i]);
+			if (ls->entries[i].fd >= 0) {
+				close(ls->entries[i].fd);
+				ls->entries[i].fd = -1;
+			}
 		}
-		kh_clear(fd_to_idx, ls->fd_map);
+		for (uint32_t i = 0; i < ls->ndead; ++i) {
+			close(ls->dead[i]);
+		}
+		free(ls->dead);
+		ls->dead = NULL;
+		ls->ndead = 0;
+		ls->dead_cap = 0;
 		return 0;
 	}
 
 	pthread_mutex_lock(&ls->lock);
 	for (uint32_t i = 0; i < ls->nentries && !force; ++i) {
 		if (atomic_load(&ls->entries[i].readers)) {
-			pthread_mutex_unlock(&ls->lock);
+			lease_unlock(ls);
 			XAL_DEBUG("FAILED: inode idx(%u) has readers", i);
 			return -EBUSY;
 		}
@@ -950,7 +1109,7 @@ xal_be_fiemap_lease_reset(struct xal *xal, bool force)
 		e->extent_cap = 0;
 	}
 	kh_clear(fd_to_idx, ls->fd_map);
-	pthread_mutex_unlock(&ls->lock);
+	lease_unlock(ls);
 
 	return 0;
 }
@@ -979,7 +1138,8 @@ xal_be_fiemap_lease_prepare(struct xal *xal)
 	free(ls->entries);
 	ls->entries = entries;
 	ls->nentries = n;
-	pthread_mutex_unlock(&ls->lock);
+	ls->hand = 0;
+	lease_unlock(ls);
 
 	return 0;
 }
@@ -989,6 +1149,7 @@ xal_be_fiemap_lease_init(struct xal *xal, const char *mountpoint, const struct x
 {
 	struct xal_be_fiemap *be = (struct xal_be_fiemap *)&xal->be;
 	struct xal_lease_set *ls;
+	struct rlimit rl;
 	struct stat st;
 	int err;
 
@@ -1005,6 +1166,14 @@ xal_be_fiemap_lease_init(struct xal *xal, const char *mountpoint, const struct x
 	ls->generation = lease_generation;
 	ls->recheck = !opts->lease_no_recheck;
 	lease_break_time();
+	ls->max_held = opts->lease_max;
+	if (!ls->max_held) {
+		ls->max_held = UINT32_MAX;
+		if (!getrlimit(RLIMIT_NOFILE, &rl) && rl.rlim_cur != RLIM_INFINITY &&
+		    rl.rlim_cur / 2 < UINT32_MAX) {
+			ls->max_held = rl.rlim_cur > 1 ? rl.rlim_cur / 2 : 1;
+		}
+	}
 	pthread_mutex_init(&ls->lock, NULL);
 
 	ls->fd_map = kh_init(fd_to_idx);
@@ -1020,8 +1189,8 @@ xal_be_fiemap_lease_init(struct xal *xal, const char *mountpoint, const struct x
 
 	be->lease = ls;
 
-	XAL_DEBUG("INFO: read-lease mode; signal(%d) to tid(%d)", lease_proc.sig,
-		  atomic_load(&lease_proc.tid));
+	XAL_DEBUG("INFO: read-lease mode; signal(%d) to tid(%d), max_held(%u)", lease_proc.sig,
+		  atomic_load(&lease_proc.tid), ls->max_held);
 
 	return 0;
 
@@ -1050,6 +1219,7 @@ xal_be_fiemap_lease_close(struct xal *xal)
 
 	kh_destroy(fd_to_idx, ls->fd_map);
 	free(ls->entries);
+	free(ls->held);
 	pthread_mutex_destroy(&ls->lock);
 	free(ls);
 	be->lease = NULL;

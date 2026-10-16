@@ -7,12 +7,14 @@
  * test check that a writer of <file> waits while the extents are held and that the extents still
  * hold the file's data meanwhile.
  *
- * Usage: xal_lease_hold [--no-recheck]
- *                       [--probe | --shm | --thread | --fork | --orphan | --idle <file2>]
+ * Usage: xal_lease_hold [--no-recheck] [--max <n>] [--exhaust]
+ *                       [--probe | --shm | --thread | --fork | --orphan | --idle <file2> |
+ *                        --sweep]
  *                       <dev_uri> <mountpoint> <file>
  *
- * --no-recheck sets xal_opts.lease_no_recheck.
- * Without a mode option, prints once the extents are held:
+ * --no-recheck sets xal_opts.lease_no_recheck and --max xal_opts.lease_max. --exhaust opens
+ * /dev/null until no descriptor is left, after the extents are held, and acquires no more. Without
+ * a mode option, prints once the extents are held:
  *   LEASE_READY pid=<pid> byte=<device byte offset of the first extent> extents=<n>
  * then waits for SIGUSR1, releases the extents and prints RELEASED err=<what xal_extents_release()
  * returned>. It then acquires them again every 50 ms until that succeeds, which it can once the
@@ -21,8 +23,9 @@
  * and waits for SIGTERM or SIGINT before closing.
  *
  * --thread takes the first acquire on a thread that exits before LEASE_READY is printed, as a
- * caller's worker thread may. --idle also acquires and releases <file2> before LEASE_READY, so
- * <file2> is under a lease with no reader while <file> is held.
+ * caller's worker thread may. --idle also acquires and releases <file2>, or every file under it
+ * if it is a directory, before LEASE_READY, so they are under a lease with no reader while <file>
+ * is held.
  *
  * --probe acquires once, prints ACQUIRE err=<err> and, on success, one line per extent:
  *   EXTENT <i> byte=<device byte offset> bytes=<length> flag=<flag>
@@ -34,6 +37,11 @@
  * <file> listed in /proc/locks, and exits. --orphan acquires and releases, forks a child that
  * sleeps for 30 s, or until a signal, with the handle open, prints ORPHAN child=<pid> once fork()
  * has returned in the child, and exits without xal_close().
+ *
+ * --sweep takes <file> as a directory, acquires and releases every file under it in walk order,
+ * then prints
+ *   SWEEP files=<n> failed=<n> err=<first error> leases=<held by this process> evicted=<n>
+ * and exits; leases is from /proc/locks and evicted from xal_lease_stats().
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -54,6 +62,7 @@
 #include <libxal.h>
 
 static volatile sig_atomic_t g_release = 0;
+static bool g_exhaust;
 static volatile sig_atomic_t g_stop = 0;
 
 static void
@@ -215,6 +224,72 @@ orphan(struct xal *xal, struct xal_inode *inode)
 	_exit(0);
 }
 
+/* Leases held by this process, as /proc/locks lists them */
+static int
+count_own_leases(void)
+{
+	char line[256], pid[32];
+	FILE *f = fopen("/proc/locks", "r");
+	int n = 0;
+
+	if (!f) {
+		return -1;
+	}
+	snprintf(pid, sizeof(pid), " %d ", (int)getpid());
+	while (fgets(line, sizeof(line), f)) {
+		if (strstr(line, "LEASE") && strstr(line, pid)) {
+			n++;
+		}
+	}
+	fclose(f);
+
+	return n;
+}
+
+struct sweep_args {
+	uint32_t files;
+	uint32_t failed;
+	int err;
+};
+
+static int
+sweep_one(struct xal *xal, struct xal_inode *inode, void *cb_args, int level)
+{
+	struct sweep_args *a = cb_args;
+	struct xal_extents *extents;
+	int err;
+
+	(void)level;
+	if (!xal_inode_is_file(inode)) {
+		return 0;
+	}
+
+	a->files++;
+	err = xal_extents_acquire(xal, inode, &extents);
+	if (!err) {
+		err = xal_extents_release(xal, inode);
+	}
+	if (err && !a->failed++) {
+		a->err = err;
+	}
+
+	return 0;
+}
+
+static int
+sweep(struct xal *xal, struct xal_inode *dir)
+{
+	struct sweep_args a = {0};
+	struct xal_lease_stats stats = {0};
+
+	xal_walk(xal, dir, sweep_one, &a);
+	xal_lease_stats(xal, &stats);
+	printf("SWEEP files=%u failed=%u err=%d leases=%d evicted=%" PRIu64 "\n", a.files, a.failed,
+	       a.err, count_own_leases(), stats.evicted);
+
+	return 0;
+}
+
 struct acquire_args {
 	struct xal *xal;
 	struct xal_inode *inode;
@@ -241,7 +316,15 @@ hold(struct xal *xal, struct xal_inode *inode, struct xal_inode *idle, bool on_t
 	struct xal_extents *extents;
 	int err;
 
-	if (idle) {
+	if (idle && !xal_inode_is_file(idle)) {
+		struct sweep_args s = {0};
+
+		xal_walk(xal, idle, sweep_one, &s);
+		if (s.failed) {
+			fprintf(stderr, "FAILED: sweep of idle; err(%d)\n", s.err);
+			return 1;
+		}
+	} else if (idle) {
 		err = xal_extents_acquire(xal, idle, &extents);
 		if (err) {
 			fprintf(stderr, "FAILED: xal_extents_acquire(idle); err(%d)\n", err);
@@ -266,6 +349,10 @@ hold(struct xal *xal, struct xal_inode *inode, struct xal_inode *idle, bool on_t
 		fprintf(stderr, "FAILED: xal_extents_acquire(); err(%d)\n", err);
 		return 1;
 	}
+	/* Left open, so that nothing is free when the lease is broken and released */
+	while (g_exhaust && open("/dev/null", O_RDONLY) >= 0) {
+		;
+	}
 	printf("LEASE_READY pid=%d byte=%" PRIu64 " extents=%u\n", (int)getpid(),
 	       first_byte(xal, extents), extents->count);
 	fflush(stdout);
@@ -277,7 +364,7 @@ hold(struct xal *xal, struct xal_inode *inode, struct xal_inode *idle, bool on_t
 	printf("RELEASED err=%d\n", err);
 	fflush(stdout);
 
-	for (int i = 0; i < 600 && !g_stop; ++i) {
+	for (int i = 0; i < 600 && !g_stop && !g_exhaust; ++i) {
 		err = xal_extents_acquire(xal, inode, &extents);
 		if (!err) {
 			printf("REACQUIRED byte=%" PRIu64 " extents=%u\n", first_byte(xal, extents),
@@ -288,9 +375,10 @@ hold(struct xal *xal, struct xal_inode *inode, struct xal_inode *idle, bool on_t
 		}
 		nanosleep(&retry, NULL);
 	}
-	if (err) {
+	if (err && !g_exhaust) {
 		fprintf(stderr, "FAILED: re-acquire; err(%d)\n", err);
 	}
+	err = g_exhaust ? 0 : err;
 
 	while (!g_stop) {
 		sigsuspend(orig);
@@ -303,10 +391,17 @@ int
 main(int argc, char *argv[])
 {
 	static const struct option longopts[] = {
-	    {"probe", no_argument, NULL, 'p'},	    {"shm", no_argument, NULL, 's'},
-	    {"thread", no_argument, NULL, 't'},	    {"fork", no_argument, NULL, 'f'},
-	    {"orphan", no_argument, NULL, 'o'},	    {"idle", required_argument, NULL, 'i'},
-	    {"no-recheck", no_argument, NULL, 'r'}, {NULL, 0, NULL, 0},
+	    {"probe", no_argument, NULL, 'p'},
+	    {"shm", no_argument, NULL, 's'},
+	    {"thread", no_argument, NULL, 't'},
+	    {"fork", no_argument, NULL, 'f'},
+	    {"orphan", no_argument, NULL, 'o'},
+	    {"idle", required_argument, NULL, 'i'},
+	    {"sweep", no_argument, NULL, 'w'},
+	    {"no-recheck", no_argument, NULL, 'r'},
+	    {"max", required_argument, NULL, 'm'},
+	    {"exhaust", no_argument, NULL, 'x'},
+	    {NULL, 0, NULL, 0},
 	};
 	struct xal_opts opts = {0};
 	struct sigaction sa = {0};
@@ -321,6 +416,14 @@ main(int argc, char *argv[])
 			opts.lease_no_recheck = 1;
 			continue;
 		}
+		if (c == 'm') {
+			opts.lease_max = strtoul(optarg, NULL, 0);
+			continue;
+		}
+		if (c == 'x') {
+			g_exhaust = true;
+			continue;
+		}
 		if (c == '?' || mode) {
 			mode = '?';
 			break;
@@ -332,8 +435,9 @@ main(int argc, char *argv[])
 	}
 	if (mode == '?' || argc - optind != 3) {
 		fprintf(stderr,
-			"Usage: %s [--no-recheck] "
-			"[--probe | --shm | --thread | --fork | --orphan | --idle <file2>] "
+			"Usage: %s [--no-recheck] [--max <n>] [--exhaust] "
+			"[--probe | --shm | --thread | --fork | --orphan | --idle <file2> | "
+			"--sweep] "
 			"<dev_uri> <mountpoint> <file>\n",
 			argv[0]);
 		return 2;
@@ -391,6 +495,8 @@ main(int argc, char *argv[])
 		ret = fork_probe(xal, inode);
 	} else if (mode == 'o') {
 		ret = orphan(xal, inode);
+	} else if (mode == 'w') {
+		ret = sweep(xal, inode);
 	} else {
 		ret = hold(xal, inode, idle, mode == 't', &orig);
 	}

@@ -65,6 +65,7 @@ struct xal_opts {
 	const char *shm_name; ///< If set, pool memory is backed by POSIX shared memory with this base name, see @xal_from_pools() for sharing the pools across processes
 	const char *subtree; ///< FIEMAP backend only: absolute path at or under the mountpoint to scope the index to. Only files under it are indexed (and, in XAL_WATCHMODE_REFLINK_SNAPSHOT, reflinked). NULL/empty indexes the whole mount. Ignored by the XFS backend.
 	int lease_no_recheck; ///< XAL_WATCHMODE_READ_LEASE only: if non-zero, xal_extents_release() does not map the file again with FIEMAP, and so misses the changes that break no lease; xal_extents_acquire() then hands out the old extents until the lease is broken or dropped. See xal_extents_release().
+	uint32_t lease_max; ///< XAL_WATCHMODE_READ_LEASE only: how many files to keep under a lease. Past it, xal drops the lease of a file without readers that was not acquired since the last pass; it is exceeded while every leased file has readers, and briefly by files being mapped at the same time. 0 for half the soft RLIMIT_NOFILE at xal_open(), or no limit when that is unlimited.
 };
 
 struct xal_extent {
@@ -562,8 +563,11 @@ xal_get_extents(struct xal *xal, char *path, struct xal_extents **extents);
  *
  * Requirements and limits of XAL_WATCHMODE_READ_LEASE:
  *  - The caller owns the files or has CAP_LEASE, and /proc/sys/fs/leases-enable is 1.
- *  - Every mapped file holds a file descriptor until its lease is broken or the index is rebuilt,
- *    so RLIMIT_NOFILE bounds how many files can be mapped at once; past it this returns -EMFILE.
+ *  - Every mapped file holds a file descriptor while it has a lease. Past xal_opts.lease_max
+ *    leases, or when xal runs out of descriptors, for a file or a release's check, it drops the
+ *    lease of a file without readers that was not acquired since the last pass, and maps that
+ *    file again on its next acquire. This returns -EMFILE only when every leased file has
+ *    readers.
  *  - The kernel lets a waiting writer through after /proc/sys/fs/lease-break-time seconds (45 by
  *    default) even if readers remain, so a reader must release within that time. A reader that
  *    releases later gets -ESTALE from xal_extents_release(), once xal's thread has taken the
@@ -583,8 +587,8 @@ xal_get_extents(struct xal *xal, char *path, struct xal_extents **extents);
  *    xal_close(), xal_index(), xal_extents_acquire(), xal_extents_release() and xal_lease_stats()
  *    hold for short spans, so do not call these while holding a lock that a fork handler of the
  *    caller takes, nor call fork() from a signal handler while a handle in this mode is open. A
- *    file being mapped at fork() stays open in the child, even after xal_close() there, until it
- *    exits or execs.
+ *    file being mapped at fork(), or whose lease another thread is dropping, stays open in the
+ *    child, even after xal_close() there, until it exits or execs.
  *  - Only changes that open the file for writing or truncate it break the lease. Others are not
  *    prevented: a dedupe (FIDEDUPERANGE) through a read-only descriptor, which the file's owner,
  *    anyone with write permission on it, or CAP_SYS_ADMIN may do; data moved by the filesystem
@@ -594,7 +598,7 @@ xal_get_extents(struct xal *xal, char *path, struct xal_extents **extents);
  *    itself are not seen at all.
  *  - Not supported together with xal_opts.shm_name.
  *  - xal_get_extents() and xal_walk() report no extents for a file until it has been acquired,
- *    nor after its lease has been broken.
+ *    nor after its lease has been broken or dropped.
  *
  * @param xal The xal struct obtained when opened with xal_open() or xal_open_from_uri()
  * @param inode A regular file in the index
@@ -642,6 +646,7 @@ struct xal_lease_stats {
 	uint64_t revoked;  ///< Leases released after a break, or after a release found them stale
 	uint64_t rescans;  ///< Times every lease was checked because notifications were lost
 	uint64_t stale;    ///< Releases that found the extents may no longer hold the file's data
+	uint64_t evicted;  ///< Leases dropped on files without readers, to stay within lease_max
 };
 
 /**
