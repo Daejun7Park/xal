@@ -8,9 +8,8 @@
  * hold the file's data meanwhile.
  *
  * Usage: xal_lease_hold [--no-recheck] [--max <n>] [--exhaust]
- *                       [--probe | --shm | --thread | --fork | --orphan | --idle <file2> |
- *                        --sweep]
- *                       <dev_uri> <mountpoint> <file>
+ *                       [--probe | --shm | --thread | --fork | --orphan | --poll | --twice |
+ *                        --idle <file2> | --sweep] <dev_uri> <mountpoint> <file>
  *
  * --no-recheck sets xal_opts.lease_no_recheck and --max xal_opts.lease_max. --exhaust opens
  * /dev/null until no descriptor is left, after the extents are held, and acquires no more. Without
@@ -21,6 +20,12 @@
  * writer has closed the file, and prints
  *   REACQUIRED byte=<device byte offset of the first extent> extents=<n>
  * and waits for SIGTERM or SIGINT before closing.
+ *
+ * --poll, instead of waiting for SIGUSR1, calls xal_extents_recalled() every 10 ms and, once it
+ * returns 1, prints RECALLED left_ms=<ms left before the kernel may let the writer through, -1
+ * for never> and releases. --twice acquires twice; the first SIGUSR1 releases once, printing
+ * RELEASED err=<err> and then RECALLED left_ms=<ms> or NOT_RECALLED, and the second releases
+ * again, printing RELEASED_OTHER err=<err>.
  *
  * --thread takes the first acquire on a thread that exits before LEASE_READY is printed, as a
  * caller's worker thread may. --idle also acquires and releases <file2>, or every file under it
@@ -48,6 +53,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <inttypes.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -307,8 +313,36 @@ acquire_thread(void *arg)
 	return NULL;
 }
 
+/* Prints what xal_extents_recalled() says; returns whether it said to release */
+static bool
+print_recalled(struct xal *xal, struct xal_inode *inode)
+{
+	uint64_t left_ns;
+
+	if (xal_extents_recalled(xal, inode, &left_ns) != 1) {
+		return false;
+	}
+	printf("RECALLED left_ms=%lld\n",
+	       left_ns == UINT64_MAX ? -1LL : (long long)(left_ns / 1000000));
+	fflush(stdout);
+
+	return true;
+}
+
+/* Until xal_extents_recalled() says to release; signals are taken meanwhile, as in sigsuspend() */
+static void
+poll_recalled(struct xal *xal, struct xal_inode *inode, const sigset_t *orig)
+{
+	struct timespec tick = {.tv_sec = 0, .tv_nsec = 10 * 1000 * 1000};
+
+	while (!g_stop && !print_recalled(xal, inode)) {
+		ppoll(NULL, 0, &tick, orig);
+	}
+}
+
+/* mode is 0, or the short option of --thread, --poll or --twice */
 static int
-hold(struct xal *xal, struct xal_inode *inode, struct xal_inode *idle, bool on_thread,
+hold(struct xal *xal, struct xal_inode *inode, struct xal_inode *idle, int mode,
      const sigset_t *orig)
 {
 	struct timespec retry = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000};
@@ -333,7 +367,7 @@ hold(struct xal *xal, struct xal_inode *inode, struct xal_inode *idle, bool on_t
 		xal_extents_release(xal, idle);
 	}
 
-	if (on_thread) {
+	if (mode == 't') {
 		pthread_t t;
 
 		if (pthread_create(&t, NULL, acquire_thread, &a) || pthread_join(t, NULL)) {
@@ -349,6 +383,10 @@ hold(struct xal *xal, struct xal_inode *inode, struct xal_inode *idle, bool on_t
 		fprintf(stderr, "FAILED: xal_extents_acquire(); err(%d)\n", err);
 		return 1;
 	}
+	if (mode == '2' && xal_extents_acquire(xal, inode, &extents)) {
+		fprintf(stderr, "FAILED: second xal_extents_acquire()\n");
+		return 1;
+	}
 	/* Left open, so that nothing is free when the lease is broken and released */
 	while (g_exhaust && open("/dev/null", O_RDONLY) >= 0) {
 		;
@@ -357,12 +395,27 @@ hold(struct xal *xal, struct xal_inode *inode, struct xal_inode *idle, bool on_t
 	       first_byte(xal, extents), extents->count);
 	fflush(stdout);
 
-	while (!g_release && !g_stop) {
+	if (mode == 'P') {
+		poll_recalled(xal, inode, orig);
+	}
+	while (mode != 'P' && !g_release && !g_stop) {
 		sigsuspend(orig);
 	}
 	err = xal_extents_release(xal, inode);
 	printf("RELEASED err=%d\n", err);
 	fflush(stdout);
+
+	if (mode == '2') {
+		if (!print_recalled(xal, inode)) {
+			printf("NOT_RECALLED\n");
+		}
+		g_release = 0;
+		while (!g_release && !g_stop) {
+			sigsuspend(orig);
+		}
+		printf("RELEASED_OTHER err=%d\n", xal_extents_release(xal, inode));
+		fflush(stdout);
+	}
 
 	for (int i = 0; i < 600 && !g_stop && !g_exhaust; ++i) {
 		err = xal_extents_acquire(xal, inode, &extents);
@@ -396,6 +449,8 @@ main(int argc, char *argv[])
 	    {"thread", no_argument, NULL, 't'},
 	    {"fork", no_argument, NULL, 'f'},
 	    {"orphan", no_argument, NULL, 'o'},
+	    {"poll", no_argument, NULL, 'P'},
+	    {"twice", no_argument, NULL, '2'},
 	    {"idle", required_argument, NULL, 'i'},
 	    {"sweep", no_argument, NULL, 'w'},
 	    {"no-recheck", no_argument, NULL, 'r'},
@@ -436,8 +491,8 @@ main(int argc, char *argv[])
 	if (mode == '?' || argc - optind != 3) {
 		fprintf(stderr,
 			"Usage: %s [--no-recheck] [--max <n>] [--exhaust] "
-			"[--probe | --shm | --thread | --fork | --orphan | --idle <file2> | "
-			"--sweep] "
+			"[--probe | --shm | --thread | --fork | --orphan | --poll | "
+			"--twice | --idle <file2> | --sweep] "
 			"<dev_uri> <mountpoint> <file>\n",
 			argv[0]);
 		return 2;
@@ -498,7 +553,7 @@ main(int argc, char *argv[])
 	} else if (mode == 'w') {
 		ret = sweep(xal, inode);
 	} else {
-		ret = hold(xal, inode, idle, mode == 't', &orig);
+		ret = hold(xal, inode, idle, mode, &orig);
 	}
 
 	xal_close(xal);

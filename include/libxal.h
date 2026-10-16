@@ -729,7 +729,9 @@ xal_get_extents(struct xal *xal, char *path, struct xal_extents **extents);
  *  - The kernel lets a waiting writer through after /proc/sys/fs/lease-break-time seconds (45 by
  *    default) even if readers remain, so a reader must release within that time. A reader that
  *    releases later gets -ESTALE from xal_extents_release(), once xal's thread has taken the
- *    break.
+ *    break. xal_extents_recalled() tells a reader that a writer waits and how long is left. A
+ *    lease-break-time of 0 makes the kernel wait for the readers however long they take; it
+ *    applies to every lease on the system.
  *  - A writer that opens with O_NONBLOCK, as coreutils truncate does, does not wait: it gets
  *    EWOULDBLOCK while any lease is held on the file, and succeeds on a retry once xal has
  *    released it.
@@ -796,6 +798,29 @@ xal_extents_acquire(struct xal *xal, struct xal_inode *inode, struct xal_extents
  */
 int
 xal_extents_release(struct xal *xal, struct xal_inode *inode);
+
+/**
+ * Say whether the readers of a file's extents should release them
+ *
+ * With XAL_WATCHMODE_READ_LEASE, a writer that opens or truncates a held file waits for its
+ * readers, and the kernel lets it through anyway after lease-break-time. A reader that holds the
+ * extents for long can call this between reads and, once it returns 1, stop reading through them
+ * and release them, so that the writer goes ahead; xal_extents_acquire() then returns -EAGAIN
+ * until the writer is done. The call takes no lock and makes no system call, except to read
+ * CLOCK_MONOTONIC for left_ns while the extents are being revoked. In other watch modes this
+ * returns 0.
+ *
+ * @param xal The xal struct obtained when opened with xal_open() or xal_open_from_uri()
+ * @param inode A regular file in the index
+ * @param left_ns If not NULL, set to the nanoseconds left before the kernel may let the writer
+ * through, UINT64_MAX when it never does, and 0 when a release found the extents stale or this
+ * returns 0
+ *
+ * @return 1 when the extents are being revoked, because a writer waits or a release found them
+ * changed; 0 when not; -EINVAL on a bad argument, -ECHILD in a forked child.
+ */
+int
+xal_extents_recalled(struct xal *xal, struct xal_inode *inode, uint64_t *left_ns);
 
 struct xal_lease_stats {
 	uint64_t mapped;   ///< Files mapped under a lease, counting re-maps
