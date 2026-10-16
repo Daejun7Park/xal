@@ -1,15 +1,18 @@
 """
 Tests for how xal_open() treats the device it is given.
 
-The default workflow leaves the filesystem unmounted.
+The default workflow leaves the filesystem unmounted; tests that need it mounted mount it and
+unmount it again. xal runs under sudo, which the device node made with mknod needs.
 """
 
 import os
+import re
 from pathlib import Path
 
 import pytest
 
 EINVAL = 22
+ENAMETOOLONG = 36
 
 
 def _artifacts(cijoe) -> Path:
@@ -32,6 +35,100 @@ def _is_nvme(dev_path) -> bool:
 
     node = Path("/sys/class/block") / Path(os.path.realpath(dev_path)).name
     return (node / "nsid").exists() or (node.resolve().parent / "nsid").exists()
+
+
+class _Mounted:
+    """Mount the configured device for the block, at mountpoint or the configured one."""
+
+    def __init__(self, cijoe, mountpoint=None):
+        self.cijoe = cijoe
+        self.dev_path = cijoe.getconf("xal.dev_path", None)
+        self.mountpoint = mountpoint or cijoe.getconf("xal.mountpoint", None)
+
+    def __enter__(self):
+        src = _capture(self.cijoe, f"findmnt -n -o SOURCE --source {self.dev_path}")
+        assert not src, f"{self.dev_path} is already mounted"
+        self.cijoe.run(f"sudo mkdir -p '{self.mountpoint}'")
+        err, _ = self.cijoe.run(f"sudo mount {self.dev_path} '{self.mountpoint}'")
+        assert not err, f"could not mount {self.dev_path}"
+        return self
+
+    def __exit__(self, *exc):
+        err, _ = self.cijoe.run(f"sudo umount '{self.mountpoint}'")
+        assert not err, f"could not unmount {self.mountpoint}"
+
+
+def _dev_numbers(cijoe, dev_path):
+    major, minor = _capture(cijoe, f"stat -c '%t %T' {dev_path}").split()
+    return int(major, 16), int(minor, 16)
+
+
+def test_backend_found_by_device_number(cijoe):
+    """A mounted block device named by another node than the mount source is found by its device
+    number and indexed through the mount. The node keeps the device's name, as xNVMe identifies a
+    block device that is not NVMe by it, and is made on devtmpfs, as /tmp may be nodev."""
+
+    dev_path = cijoe.getconf("xal.dev_path", None)
+    alias = Path("/dev/xal_dev_alias") / Path(dev_path).name
+    major, minor = _dev_numbers(cijoe, dev_path)
+    cijoe.run(f"sudo mkdir -p {alias.parent}")
+    try:
+        cijoe.run(f"sudo mknod {alias} b {major} {minor}")
+        with _Mounted(cijoe) as m:
+            out = _capture(cijoe, f"sudo xal --meta {alias}")
+    finally:
+        cijoe.run(f"sudo rm -rf {alias.parent}")
+
+    assert "xal_be_fiemap:" in out, f"the mounted device was not opened with FIEMAP:\n{out}"
+    assert f"mountpoint: {m.mountpoint}" in out, out
+
+
+def test_backend_found_at_escaped_mountpoint(cijoe):
+    """A mount point with a space, which the kernel writes as \\040, is found as it is."""
+
+    try:
+        with _Mounted(cijoe, "/tmp/xal testing space") as m:
+            out = _capture(cijoe, f"sudo xal --meta {m.dev_path}")
+    finally:
+        cijoe.run("sudo rmdir '/tmp/xal testing space'")
+
+    assert f"mountpoint: {m.mountpoint}" in out, f"the mount point was not found:\n{out}"
+
+
+def test_backend_reports_long_mountpoint(cijoe):
+    """A mount point longer than XAL_PATH_MAXLEN is reported, not taken for no mount, which would
+    have the XFS backend parse the mounted filesystem."""
+
+    top = "/tmp/xal_long"
+    path = f"{top}/{'a' * 100}/{'b' * 100}/{'c' * 60}"
+    try:
+        with _Mounted(cijoe, path) as m:
+            out = _capture(cijoe, f"sudo xal --meta {m.dev_path}")
+    finally:
+        cijoe.run(f"sudo rm -rf --one-file-system {top}")
+
+    assert f"xal_open(...); err(-{ENAMETOOLONG})" in out, out
+
+
+def test_backend_lba_size_unset_without_identify(cijoe):
+    """Through a symlink named unlike a block device that is not NVMe, xNVMe cannot identify it,
+    so the LBA size is left unset rather than taken as 1 byte."""
+
+    dev_path = cijoe.getconf("xal.dev_path", None)
+    if _is_nvme(dev_path):
+        pytest.skip("xNVMe identifies an NVMe namespace by ioctl, whatever its name")
+
+    link = _artifacts(cijoe) / "xal_dev_link"
+    cijoe.run(f"ln -sfn {dev_path} {link}")
+    try:
+        with _Mounted(cijoe):
+            named = _capture(cijoe, f"sudo xal --meta {dev_path}")
+            linked = _capture(cijoe, f"sudo xal --meta {link}")
+    finally:
+        cijoe.run(f"rm -f {link}")
+
+    assert re.search(r"sb.lba_blksze: [1-9]", named), named
+    assert "sb.lba_blksze: 0" in linked, linked
 
 
 def test_backend_xfs_reports_read_error(cijoe):

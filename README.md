@@ -141,8 +141,16 @@ For details on the XFS on-disk format as parsed by this backend, see
 ### Auto-detection
 
 If `opts.be` is left as 0, `xal_open()` auto-selects the backend: if the
-device URI is found in `/proc/mounts` the FIEMAP backend is chosen,
-otherwise XFS is used.
+filesystem on the device is mounted the FIEMAP backend is chosen, otherwise
+XFS is used. The mount is looked up in `/proc/self/mountinfo`: a block
+device by its device number, so that another node for it, such as
+`/dev/dm-0` for `/dev/mapper/vg-lv`, is found too, and other URIs, or a
+filesystem with an anonymous device number such as btrfs, by the mount
+source. A mount of the filesystem's root is preferred over a bind mount of a
+directory in it, and mount points that are not directories or have something
+mounted over them are skipped. An error other than finding no mount, such as
+`-ENAMETOOLONG` for a mount point longer than `XAL_PATH_MAXLEN`, is returned
+rather than taken for no mount.
 
 ## API Usage
 
