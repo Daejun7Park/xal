@@ -7,10 +7,12 @@ unmount it again. xal runs under sudo, which the device node made with mknod nee
 
 import os
 import re
+import time
 from pathlib import Path
 
 import pytest
 
+EBUSY = 16
 EINVAL = 22
 ENAMETOOLONG = 36
 
@@ -148,3 +150,64 @@ def test_backend_xfs_reports_read_error(cijoe):
         cijoe.run(f"rm -f {link}")
 
     assert f"xal_open(...); err(-{EINVAL})" in out, out
+
+
+def test_backend_xfs_refuses_mounted_device(cijoe):
+    """The XFS backend does not parse the on-disk format of a mounted filesystem."""
+
+    with _Mounted(cijoe) as m:
+        out = _capture(cijoe, f"xal --backend xfs --meta {m.dev_path}")
+
+    assert f"xal_open(...); err(-{EBUSY})" in out, f"a mounted device was parsed raw:\n{out}"
+
+
+def test_backend_xfs_refuses_claimed_device(cijoe):
+    """Nor that of a device someone else holds exclusively, as a dm or md device does."""
+
+    dev_path = cijoe.getconf("xal.dev_path", None)
+    fd = os.open(dev_path, os.O_RDONLY | os.O_EXCL)
+    try:
+        out = _capture(cijoe, f"xal --backend xfs --meta {dev_path}")
+    finally:
+        os.close(fd)
+
+    assert f"xal_open(...); err(-{EBUSY})" in out, f"a claimed device was parsed raw:\n{out}"
+
+
+def test_backend_xfs_keeps_device_from_mount(cijoe):
+    """While the XFS backend reads a device, it cannot be mounted, nor opened by another handle
+    with the XFS backend; once closed, it can be mounted."""
+
+    dev_path = cijoe.getconf("xal.dev_path", None)
+    mountpoint = cijoe.getconf("xal.mountpoint", None)
+    log = _artifacts(cijoe) / "xal_xfs_hold.log"
+    pidfile = _artifacts(cijoe) / "xal_xfs_hold.pid"
+    cijoe.run(f"rm -f {log} {pidfile}")
+    cijoe.run(f"sh -c 'nohup xal_xfs_hold {dev_path} > {log} 2>&1 & echo $! > {pidfile}'")
+    pid = int(pidfile.read_text())
+    try:
+        for _ in range(100):
+            if log.exists() and "READY" in log.read_text():
+                break
+            time.sleep(0.1)
+        assert re.search(r"READY err=0", log.read_text()), log.read_text()
+
+        cijoe.run(f"sudo mkdir -p {mountpoint}")
+        out = _capture(cijoe, f"sh -c 'sudo mount {dev_path} {mountpoint} 2>&1; echo rc=$?'")
+        if "rc=0" in out:
+            cijoe.run(f"sudo umount {mountpoint}")
+        assert "rc=0" not in out, "the device was mounted while the XFS backend held it"
+        assert "busy" in out, f"mount failed for another reason:\n{out}"
+
+        out = _capture(cijoe, f"xal --backend xfs --meta {dev_path}")
+        assert f"xal_open(...); err(-{EBUSY})" in out, f"a second handle opened:\n{out}"
+    finally:
+        cijoe.run(f"kill {pid}")
+        for _ in range(100):
+            if cijoe.run(f"kill -0 {pid}")[0]:
+                break
+            time.sleep(0.1)
+        cijoe.run(f"rm -f {pidfile}")
+
+    with _Mounted(cijoe):
+        pass

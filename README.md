@@ -133,7 +133,14 @@ drivers (e.g., SPDK/NVMe, xNVMe/uPCIe) or peripheral devices (e.g.,
 xNVMe/uPCIe/CUDA) where the OS has no control over the storage.
 
 There is no notification infrastructure for this backend, since the filesystem
-is not mounted and changes are not expected.
+is not mounted and changes are not expected. A block device is opened with
+`O_EXCL`, as `mount` does, until `xal_close()`: `xal_open()` returns `-EBUSY`
+while it is mounted, claimed otherwise (by dm, md or swap, or for a whole disk
+through one of its partitions, and the other way round), or held by another
+XFS-backend handle, which `xal_from_shm()` shares instead, and meanwhile it
+cannot be mounted or opened exclusively. Readers attached with
+`xal_from_shm()` hold no claim of their own. Other writers are not stopped.
+Character devices, such as `/dev/ngXnY`, and image files are not claimed.
 
 For details on the XFS on-disk format as parsed by this backend, see
 [docs/xfs-internals.md](docs/xfs-internals.md).

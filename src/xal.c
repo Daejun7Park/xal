@@ -830,6 +830,7 @@ xal_from_shm(const char *shm_name, struct xal **out)
 		struct xal_be_xfs *be = (struct xal_be_xfs *)&xal->be;
 		be->base.type = XAL_BACKEND_XFS;
 		be->base.close = xal_be_xfs_close;
+		be->bdev_fd = -1;
 	}
 
 	*out = xal;

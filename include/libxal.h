@@ -318,6 +318,12 @@ xal_pp(struct xal *xal);
  * dev; for a block device that is not NVMe it identifies by the name the URI ends in, so such a
  * device must be named as the kernel names it.
  *
+ * XAL_BACKEND_XFS opens a block device with O_EXCL until xal_close(), as mount does, and returns
+ * -EBUSY while it is mounted, claimed otherwise (by dm, md or swap, or for a whole disk through
+ * one of its partitions, and the other way round), or held by another handle with this backend;
+ * meanwhile it cannot be mounted. Other writers are not stopped, and character devices and image
+ * files are not claimed.
+ *
  * With XAL_BACKEND_FIEMAP, the mountpoint and opts->subtree must be directories, not symlinks to
  * one; -ENOTDIR is returned otherwise. A subtree on another filesystem than the mountpoint is
  * rejected with -EXDEV, and a mountpoint of / with -EINVAL. The filesystem must stay mounted for
