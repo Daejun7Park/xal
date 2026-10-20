@@ -346,6 +346,12 @@ xal_close(struct xal *xal);
  * from xal_from_shm(). This holds for both backends, also XAL_BACKEND_FIEMAP where the call
  * otherwise does nothing.
  *
+ * With XAL_BACKEND_XFS the inode chunks are read through a temporary xNVMe queue on the device, in
+ * reads of up to 128 KiB, or the device's MDTS when smaller, merged across small holes, up to 32 of
+ * them submitted at once into one buffer of up to 4 MiB from xnvme_buf_alloc(). How many are in
+ * flight is up to the device's async interface; without a queue or such a buffer they are read one
+ * at a time.
+ *
  * @param xal Pointer to the xal
  *
  * @returns On success, 0 is returned. On error, negative errno is returned to indicate the error.

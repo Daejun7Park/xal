@@ -28,8 +28,11 @@ KHASH_MAP_INIT_INT64(ino_to_dinode, struct xal_odf_dinode *);
 static int
 decode_dentry(void *buf, struct xal_inode *dentry);
 
+struct chunks;
+
 static int
-retrieve_dinodes_via_iab3(struct xal *xal, struct xal_ag *ag, uint64_t blkno, uint64_t *index);
+retrieve_dinodes_via_iab3(struct xal *xal, struct xal_ag *ag, uint64_t blkno,
+			  struct chunks *chunks);
 
 static int
 process_ino(struct xal *xal, uint64_t ino, struct xal_inode *self);
@@ -84,6 +87,235 @@ dev_read_into(struct xnvme_dev *dev, void *iobuf, size_t count, off_t offset, vo
 	memcpy(buf, iobuf, count);
 
 	return 0;
+}
+
+/* Reads in flight at once when batch_read() has an xNVMe queue */
+#define BATCH_QDEPTH 32
+
+/* A hole of up to this many bytes between two items is read through rather than split at */
+#define BATCH_GAP_NBYTES (64 * 1024UL)
+
+struct batch_item {
+	uint64_t ofz;	 ///< Byte offset on the device
+	uint32_t nbytes; ///< Number of bytes to read
+	uint32_t idx;	 ///< The caller's index for the item
+};
+
+/**
+ * Called by batch_read() once for each item with its bytes, in no particular order. A non-zero
+ * return stops further reads and is what batch_read() returns.
+ */
+typedef int (*batch_item_fn)(struct xal *xal, const struct batch_item *item, const uint8_t *data,
+			     void *arg);
+
+struct batch;
+
+struct batch_slot {
+	struct batch *batch;
+	uint8_t *buf;
+	uint64_t ofz;  ///< Device offset of the read in this slot
+	size_t first;  ///< Index of the first item the read covers
+	size_t nitems; ///< Number of items the read covers
+	bool busy;
+};
+
+struct batch {
+	struct xal *xal;
+	struct batch_item *items;
+	batch_item_fn fn;
+	void *arg;
+	int err;
+	uint32_t nslots;
+	struct batch_slot slots[BATCH_QDEPTH];
+};
+
+static int
+batch_item_cmp(const void *a, const void *b)
+{
+	const struct batch_item *x = a, *y = b;
+
+	return (x->ofz > y->ofz) - (x->ofz < y->ofz);
+}
+
+static void
+batch_deliver(struct batch_slot *slot)
+{
+	struct batch *batch = slot->batch;
+
+	for (size_t i = slot->first; i < slot->first + slot->nitems && !batch->err; ++i) {
+		const struct batch_item *item = &batch->items[i];
+
+		batch->err =
+		    batch->fn(batch->xal, item, slot->buf + (item->ofz - slot->ofz), batch->arg);
+	}
+	slot->busy = false;
+}
+
+static void
+batch_complete(struct xnvme_cmd_ctx *ctx, void *cb_arg)
+{
+	struct batch_slot *slot = cb_arg;
+
+	if (xnvme_cmd_ctx_cpl_status(ctx)) {
+		XAL_DEBUG("FAILED: read at ofz(%" PRIu64 ")", slot->ofz);
+		if (!slot->batch->err) {
+			slot->batch->err = -EIO;
+		}
+		slot->busy = false;
+	} else {
+		batch_deliver(slot);
+	}
+
+	xnvme_queue_put_cmd_ctx(ctx->async.queue, ctx);
+}
+
+/**
+ * Read the given items and hand each one's bytes to 'fn'
+ *
+ * The items are sorted by offset (in place) and merged into reads of at most BUF_NBYTES, or the
+ * device's MDTS rounded down to whole filesystem blocks when smaller, that also read through holes
+ * of up to BATCH_GAP_NBYTES. They are submitted through an xNVMe queue of capacity BATCH_QDEPTH on
+ * the device; how many are in flight at once is up to the device's async interface (xNVMe's
+ * default, emu, runs them one at a time). The buffers come from one xnvme_buf_alloc() of
+ * BATCH_QDEPTH reads, halved until it succeeds, or are be->buf when none can be had or the device
+ * gives no queue; reads then go one at a time. An item that is empty, not aligned to the LBA size,
+ * or larger than a read is rejected with -EINVAL.
+ *
+ * @return On success, 0 is returned. On error, negative errno is returned.
+ */
+static int
+batch_read(struct xal *xal, struct batch_item *items, size_t nitems, batch_item_fn fn, void *arg)
+{
+	const struct xnvme_geo *geo = xnvme_dev_get_geo(xal->dev);
+	uint64_t max_nbytes = BUF_NBYTES < geo->mdts_nbytes ? BUF_NBYTES : geo->mdts_nbytes;
+	struct xal_be_xfs *be = (struct xal_be_xfs *)&xal->be;
+	struct batch batch = {.xal = xal, .items = items, .fn = fn, .arg = arg};
+	struct xnvme_queue *queue = NULL;
+	uint8_t *mem = NULL;
+	int err;
+
+	/* xNVMe caps the MDTS for Linux NVMe ioctls at a count of LBAs (0.7.5: 127; main:
+	 * max_segments - 1 physical blocks); keep the read buffers whole filesystem blocks */
+	if (max_nbytes >= xal->sb.blocksize) {
+		max_nbytes -= max_nbytes % xal->sb.blocksize;
+	}
+	if (nitems > UINT32_MAX) {
+		return -EINVAL;
+	}
+	for (size_t i = 0; i < nitems; ++i) {
+		if (!items[i].nbytes || items[i].nbytes > max_nbytes ||
+		    items[i].ofz % geo->lba_nbytes || items[i].nbytes % geo->lba_nbytes) {
+			XAL_DEBUG("FAILED: item ofz(%" PRIu64 ") nbytes(%" PRIu32 ")", items[i].ofz,
+				  items[i].nbytes);
+			return -EINVAL;
+		}
+	}
+	if (!nitems) {
+		return 0;
+	}
+
+	qsort(items, nitems, sizeof(*items), batch_item_cmp);
+
+	for (batch.nslots = BATCH_QDEPTH; batch.nslots > 1 && !mem; batch.nslots /= 2) {
+		mem = xnvme_buf_alloc(xal->dev, batch.nslots * max_nbytes);
+		if (mem && xnvme_queue_init(xal->dev, batch.nslots, 0, &queue)) {
+			XAL_DEBUG("INFO: no queue, reading one at a time");
+			xnvme_buf_free(xal->dev, mem);
+			mem = NULL;
+			queue = NULL;
+			break;
+		}
+		if (mem) {
+			break;
+		}
+	}
+	if (!mem) {
+		batch.nslots = 1;
+	}
+	for (uint32_t s = 0; s < batch.nslots; ++s) {
+		batch.slots[s].batch = &batch;
+		batch.slots[s].buf = mem ? mem + s * max_nbytes : be->buf;
+	}
+
+	for (size_t i = 0; i < nitems && !batch.err;) {
+		uint64_t ofz = items[i].ofz, end = ofz + items[i].nbytes;
+		struct batch_slot *slot = NULL;
+		struct xnvme_cmd_ctx *ctx;
+		size_t first = i;
+
+		for (++i; i < nitems; ++i) {
+			uint64_t item_end = items[i].ofz + items[i].nbytes;
+			uint64_t new_end = item_end > end ? item_end : end;
+
+			if (items[i].ofz > end + BATCH_GAP_NBYTES || new_end - ofz > max_nbytes) {
+				break;
+			}
+			end = new_end;
+		}
+
+		while (!slot && !batch.err) {
+			for (uint32_t s = 0; s < batch.nslots && !slot; ++s) {
+				if (!batch.slots[s].busy) {
+					slot = &batch.slots[s];
+				}
+			}
+			if (!slot) {
+				err = xnvme_queue_poke(queue, 0);
+				if (err < 0) {
+					XAL_DEBUG("FAILED: xnvme_queue_poke(); err(%d)", err);
+					batch.err = err;
+				}
+			}
+		}
+		if (batch.err) {
+			break;
+		}
+		slot->ofz = ofz;
+		slot->first = first;
+		slot->nitems = i - first;
+		slot->busy = true;
+
+		if (!queue) {
+			err = dev_read(xal->dev, slot->buf, end - ofz, ofz);
+			if (err) {
+				batch.err = err;
+				break;
+			}
+			batch_deliver(slot);
+			continue;
+		}
+
+		/* A free slot means a free command context: the queue has one per slot */
+		ctx = xnvme_queue_get_cmd_ctx(queue);
+		if (!ctx) {
+			XAL_DEBUG("FAILED: xnvme_queue_get_cmd_ctx()");
+			slot->busy = false;
+			batch.err = -ENOMEM;
+			break;
+		}
+		xnvme_cmd_ctx_set_cb(ctx, batch_complete, slot);
+		err = xnvme_nvm_read(ctx, xnvme_dev_get_nsid(xal->dev), ofz / geo->lba_nbytes,
+				     (end - ofz) / geo->lba_nbytes - 1, slot->buf, NULL);
+		if (err) {
+			XAL_DEBUG("FAILED: xnvme_nvm_read(); err(%d)", err);
+			xnvme_queue_put_cmd_ctx(queue, ctx);
+			slot->busy = false;
+			batch.err = err;
+		}
+	}
+
+	if (queue) {
+		err = xnvme_queue_drain(queue);
+		if (err < 0 && !batch.err) {
+			batch.err = err;
+		}
+		xnvme_queue_term(queue);
+	}
+	if (mem) {
+		xnvme_buf_free(xal->dev, mem);
+	}
+
+	return batch.err;
 }
 
 static int
@@ -320,17 +552,28 @@ read_iab3_block(struct xal *xal, struct xal_ag *ag, uint64_t blkno, void *buf)
 	return 0;
 }
 
+/* An inode chunk from the inobt, to be read once all of them are known */
+struct chunk {
+	uint64_t ofz;	   ///< Byte offset of the chunk on the device
+	uint64_t free;	   ///< Bit per inode, set when the inode is free
+	uint16_t holemask; ///< Bit per four inodes, set when they are not allocated (sparse)
+};
+
+struct chunks {
+	struct chunk *chunks;
+	size_t nchunks;
+	size_t capacity;
+	uint64_t ninodes; ///< Allocated inodes copied into be->dinodes so far
+};
+
 static int
-decode_iab3_leaf_records(struct xal *xal, struct xal_ag *ag, void *buf, uint64_t *index)
+decode_iab3_leaf_records(struct xal *xal, struct xal_ag *ag, void *buf, struct chunks *chunks)
 {
 	struct xal_odf_btree_sfmt *root = (void *)buf;
-	struct xal_be_xfs *be = (struct xal_be_xfs *)&xal->be;
-	int err = 0;
 
 	XAL_DEBUG("ENTER");
 
 	for (uint16_t reci = 0; reci < root->pos.numrecs; ++reci) {
-		uint8_t inodechunk[BUF_NBYTES] = {0};
 		struct xal_odf_inobt_rec *rec;
 		uint32_t agbino;
 		uint64_t agbno;
@@ -356,53 +599,22 @@ decode_iab3_leaf_records(struct xal *xal, struct xal_ag *ag, void *buf, uint64_t
 		 */
 		assert(agbino == 0);
 
-		/**
-		 * Populate the inode-buffer with data from all the blocks
-		 */
-		{
-			uint64_t chunk_nbytes =
-			    (CHUNK_NINO / xal->sb.inopblock) * xal->sb.blocksize;
-			uint64_t chunk_offset = agbno * xal->sb.blocksize + ag->offset;
+		if (chunks->nchunks == chunks->capacity) {
+			size_t capacity = chunks->capacity ? chunks->capacity * 2 : 1024;
+			struct chunk *grown = realloc(chunks->chunks, capacity * sizeof(*grown));
 
-			assert(chunk_nbytes < BUF_NBYTES);
-
-			memset(be->buf, 0, chunk_nbytes);
-
-			err = dev_read(xal->dev, be->buf, chunk_nbytes, chunk_offset);
-			if (err) {
-				XAL_DEBUG("FAILED: dev_read(chunk)");
-				return err;
+			if (!grown) {
+				XAL_DEBUG("FAILED: realloc()");
+				return -ENOMEM;
 			}
-			memcpy(inodechunk, be->buf, chunk_nbytes);
+			chunks->chunks = grown;
+			chunks->capacity = capacity;
 		}
-
-		/**
-		 * Traverse the inodes in the chunk, skipping unused and free inodes.
-		 */
-		for (uint8_t chunk_index = 0; chunk_index < CHUNK_NINO; ++chunk_index) {
-			uint8_t *chunk_cursor = &inodechunk[chunk_index * xal->sb.inodesize];
-			uint64_t is_unused = (rec->holemask >> (chunk_index / 4)) & 1;
-			uint64_t is_free = (rec->free & (1ULL << chunk_index)) >> chunk_index;
-			khash_t(ino_to_dinode) *dinodes_map = be->dinodes_map;
-			struct xal_odf_dinode *dinode;
-			khiter_t iter;
-
-			if (is_unused || is_free) {
-				continue;
-			}
-
-			dinode = (void *)&be->dinodes[*index * xal->sb.inodesize];
-			memcpy(dinode, (void *)chunk_cursor, xal->sb.inodesize);
-
-			iter = kh_put(ino_to_dinode, dinodes_map, be64toh(dinode->ino), &err);
-			if (err < 0) {
-				XAL_DEBUG("FAILED: kh_put()");
-				return -EIO;
-			}
-			kh_value(dinodes_map, iter) = dinode;
-
-			*index += 1;
-		}
+		chunks->chunks[chunks->nchunks++] = (struct chunk){
+		    .ofz = agbno * xal->sb.blocksize + ag->offset,
+		    .free = rec->free,
+		    .holemask = rec->holemask,
+		};
 	}
 
 	XAL_DEBUG("EXIT");
@@ -411,10 +623,58 @@ decode_iab3_leaf_records(struct xal *xal, struct xal_ag *ag, void *buf, uint64_t
 }
 
 /**
+ * Copy the allocated inodes of the chunk read for 'item' into be->dinodes; a batch_item_fn
+ */
+static int
+decode_chunk(struct xal *xal, const struct batch_item *item, const uint8_t *data, void *arg)
+{
+	struct xal_be_xfs *be = (struct xal_be_xfs *)&xal->be;
+	khash_t(ino_to_dinode) *dinodes_map = be->dinodes_map;
+	struct chunks *chunks = arg;
+	const struct chunk *chunk = &chunks->chunks[item->idx];
+
+	/**
+	 * Traverse the inodes in the chunk, skipping unused and free inodes.
+	 */
+	for (uint8_t chunk_index = 0; chunk_index < CHUNK_NINO; ++chunk_index) {
+		const uint8_t *chunk_cursor = &data[chunk_index * xal->sb.inodesize];
+		uint64_t is_unused = (chunk->holemask >> (chunk_index / 4)) & 1;
+		uint64_t is_free = (chunk->free & (1ULL << chunk_index)) >> chunk_index;
+		struct xal_odf_dinode *dinode;
+		khiter_t iter;
+		int err;
+
+		if (is_unused || is_free) {
+			continue;
+		}
+
+		if (chunks->ninodes == xal->sb.nallocated) {
+			XAL_DEBUG("FAILED: more allocated inodes than the AGIs count(%" PRIu64 ")",
+				  xal->sb.nallocated);
+			return -EINVAL;
+		}
+
+		dinode = (void *)&be->dinodes[chunks->ninodes * xal->sb.inodesize];
+		memcpy(dinode, chunk_cursor, xal->sb.inodesize);
+
+		iter = kh_put(ino_to_dinode, dinodes_map, be64toh(dinode->ino), &err);
+		if (err < 0) {
+			XAL_DEBUG("FAILED: kh_put()");
+			return -EIO;
+		}
+		kh_value(dinodes_map, iter) = dinode;
+
+		chunks->ninodes += 1;
+	}
+
+	return 0;
+}
+
+/**
  * Decodes the node and invokes retrieve_dinodes_via_iab3() for each decoded record.
  */
 static int
-decode_iab3_node_records(struct xal *xal, struct xal_ag *ag, void *buf, uint64_t *index)
+decode_iab3_node_records(struct xal *xal, struct xal_ag *ag, void *buf, struct chunks *chunks)
 {
 	uint32_t pointers[ODF_BLOCK_FS_BYTES_MAX / sizeof(uint32_t)] = {0};
 	struct xal_odf_btree_sfmt *node = (void *)buf;
@@ -433,7 +693,7 @@ decode_iab3_node_records(struct xal *xal, struct xal_ag *ag, void *buf, uint64_t
 		uint32_t blkno = be32toh(pointers[rec]);
 
 		XAL_DEBUG("INFO: ptr[%" PRIu16 "] = 0x%" PRIx32, rec, blkno);
-		err = retrieve_dinodes_via_iab3(xal, ag, blkno, index);
+		err = retrieve_dinodes_via_iab3(xal, ag, blkno, chunks);
 		if (err) {
 			XAL_DEBUG("FAILED: retrieve_dinodes_via_iab3() : err(%d)", err);
 			return err;
@@ -446,12 +706,12 @@ decode_iab3_node_records(struct xal *xal, struct xal_ag *ag, void *buf, uint64_t
 }
 
 /**
- * Retrieve all the allocated inodes stored within the given allocation group
+ * Gather the inode chunks recorded in the inode-allocation-b+tree of the given allocation group
  *
  * It is assumed that the inode-allocation-b+tree is rooted at the given 'blkno'
  */
 static int
-retrieve_dinodes_via_iab3(struct xal *xal, struct xal_ag *ag, uint64_t blkno, uint64_t *index)
+retrieve_dinodes_via_iab3(struct xal *xal, struct xal_ag *ag, uint64_t blkno, struct chunks *chunks)
 {
 	uint8_t block[ODF_BLOCK_FS_BYTES_MAX] = {0};
 	struct xal_odf_btree_sfmt *node = (void *)block;
@@ -468,7 +728,7 @@ retrieve_dinodes_via_iab3(struct xal *xal, struct xal_ag *ag, uint64_t blkno, ui
 
 	switch (node->pos.level) {
 	case 1:
-		err = decode_iab3_node_records(xal, ag, block, index);
+		err = decode_iab3_node_records(xal, ag, block, chunks);
 		if (err) {
 			XAL_DEBUG("FAILED: decode_iab3_node(); err(%d)", err);
 			return err;
@@ -476,7 +736,7 @@ retrieve_dinodes_via_iab3(struct xal *xal, struct xal_ag *ag, uint64_t blkno, ui
 		break;
 
 	case 0:
-		err = decode_iab3_leaf_records(xal, ag, block, index);
+		err = decode_iab3_leaf_records(xal, ag, block, chunks);
 		if (err) {
 			XAL_DEBUG("FAILED: decode_iab3_leaf(); err(%d)", err);
 			return err;
@@ -497,7 +757,9 @@ int
 xal_dinodes_retrieve(struct xal *xal)
 {
 	struct xal_be_xfs *be = (struct xal_be_xfs *)&xal->be;
-	uint64_t index = 0;
+	struct chunks chunks = {0};
+	struct batch_item *items = NULL;
+	int err = 0;
 
 	if (xal->procrole == XAL_PROCROLE_SECONDARY) {
 		return -EINVAL;
@@ -522,19 +784,48 @@ xal_dinodes_retrieve(struct xal *xal)
 		return -errno;
 	}
 
-	for (uint32_t seqno = 0; seqno < xal->sb.agcount; ++seqno) {
+	/* Walk every inobt first, so that all the chunks are known and can be read together */
+	for (uint32_t seqno = 0; seqno < xal->sb.agcount && !err; ++seqno) {
 		struct xal_ag *ag = &be->ags[seqno];
-		int err;
 
 		XAL_DEBUG("INFO: seqno: %" PRIu32 "", seqno);
 
-		err = retrieve_dinodes_via_iab3(xal, ag, ag->agi_root, &index);
+		err = retrieve_dinodes_via_iab3(xal, ag, ag->agi_root, &chunks);
 		if (err) {
 			XAL_DEBUG("FAILED: retrieve_dinodes_via_iab3(); err(%d)", err);
-			free(be->dinodes);
-			be->dinodes = NULL;
-			return err;
 		}
+	}
+
+	if (err) {
+		goto exit;
+	}
+
+	items = calloc(chunks.nchunks ? chunks.nchunks : 1, sizeof(*items));
+	if (!items) {
+		XAL_DEBUG("FAILED: calloc()");
+		err = -ENOMEM;
+		goto exit;
+	}
+	for (size_t i = 0; i < chunks.nchunks; ++i) {
+		items[i] = (struct batch_item){
+		    .ofz = chunks.chunks[i].ofz,
+		    .nbytes = (CHUNK_NINO / xal->sb.inopblock) * xal->sb.blocksize,
+		    .idx = i,
+		};
+	}
+	err = batch_read(xal, items, chunks.nchunks, decode_chunk, &chunks);
+	if (err) {
+		XAL_DEBUG("FAILED: batch_read(chunks); err(%d)", err);
+	}
+
+exit:
+	free(items);
+	free(chunks.chunks);
+
+	if (err) {
+		free(be->dinodes);
+		be->dinodes = NULL;
+		return err;
 	}
 
 	XAL_DEBUG("EXIT");
