@@ -25,6 +25,13 @@ struct pair_u64 {
 
 KHASH_MAP_INIT_INT64(ino_to_dinode, struct xal_odf_dinode *);
 
+/* A block read ahead by dirblocks_read(): its bytes and how many of them were read */
+struct dirblock {
+	uint8_t *data;
+	uint32_t nbytes;
+};
+KHASH_MAP_INIT_INT64(ofz_to_block, struct dirblock);
+
 static int
 decode_dentry(void *buf, struct xal_inode *dentry);
 
@@ -316,6 +323,35 @@ batch_read(struct xal *xal, struct batch_item *items, size_t nitems, batch_item_
 	}
 
 	return batch.err;
+}
+
+/* Directory and bmbt blocks read ahead by dirblocks_read() for one xal_index() */
+struct dirblocks {
+	kh_ofz_to_block_t *map; ///< Device offset to the bytes of the block
+	uint8_t *areas[2];	///< The blocks of the two read-ahead rounds
+};
+
+/**
+ * Read a block the index needs into 'buf': from the blocks dirblocks_read() read ahead when it is
+ * one of them, from the device otherwise
+ */
+static int
+read_index_block(struct xal *xal, uint64_t ofz, size_t nbytes, void *buf)
+{
+	struct xal_be_xfs *be = (struct xal_be_xfs *)&xal->be;
+	struct dirblocks *dirblocks = be->dirblocks;
+
+	if (dirblocks) {
+		khiter_t iter = kh_get(ofz_to_block, dirblocks->map, ofz);
+
+		if (iter != kh_end(dirblocks->map) &&
+		    nbytes <= kh_value(dirblocks->map, iter).nbytes) {
+			memcpy(buf, kh_value(dirblocks->map, iter).data, nbytes);
+			return 0;
+		}
+	}
+
+	return dev_read_into(xal->dev, be->buf, nbytes, ofz, buf);
 }
 
 static int
@@ -1122,15 +1158,14 @@ static int
 btree_lblock_read(struct xal *xal, uint64_t fsbno, void *buf)
 {
 	struct xal_odf_btree_lfmt *block = (void *)buf;
-	struct xal_be_xfs *be = (struct xal_be_xfs *)&xal->be;
 	uint64_t ofz = xal_fsbno_offset(xal, fsbno);
 	int err = -ENOSYS;
 
 	XAL_DEBUG("ENTER: fsbno(0x%" PRIx64 ", %" PRIu64 ") @ ofz(%" PRIu64 ")", fsbno, fsbno, ofz);
 
-	err = dev_read_into(xal->dev, be->buf, xal->sb.blocksize, ofz, buf);
+	err = read_index_block(xal, ofz, xal->sb.blocksize, buf);
 	if (err) {
-		XAL_DEBUG("FAILED: dev_read_into(); err(%d)", err);
+		XAL_DEBUG("FAILED: read_index_block(); err(%d)", err);
 		return err;
 	}
 
@@ -1162,7 +1197,6 @@ btree_lblock_decode_leaf_records(struct xal *xal, void *buf, struct xal_inode *s
 {
 	struct xal_odf_btree_lfmt *leaf = buf;
 	struct pair_u64 *pairs = (void *)(((uint8_t *)buf) + sizeof(*leaf));
-	struct xal_be_xfs *be = (struct xal_be_xfs *)&xal->be;
 	const uint32_t fsblk_per_dblk = xal->sb.dirblocksize / xal->sb.blocksize;
 
 	XAL_DEBUG("ENTER: Directory Extents -- B+Tree -- Leaf Node");
@@ -1199,8 +1233,7 @@ btree_lblock_decode_leaf_records(struct xal *xal, void *buf, struct xal_inode *s
 			XAL_DEBUG("INFO:   dblk(%zu/%zu)", (fsblk / fsblk_per_dblk) + 1,
 				  extent.nblocks / fsblk_per_dblk);
 
-			err = dev_read_into(xal->dev, be->buf, xal->sb.dirblocksize, ofz_disk,
-					    dblock);
+			err = read_index_block(xal, ofz_disk, xal->sb.dirblocksize, dblock);
 			if (err) {
 				XAL_DEBUG("FAILED: !dev_read(directory-extent)");
 				return err;
@@ -1791,7 +1824,6 @@ decode_dentry(void *buf, struct xal_inode *dentry)
 static int
 process_dinode_dir_extents_dblock(struct xal *xal, uint64_t fsbno, struct xal_inode *self)
 {
-	struct xal_be_xfs *be = (struct xal_be_xfs *)&xal->be;
 	uint8_t dblock[ODF_BLOCK_FS_BYTES_MAX] = {0};
 	union xal_odf_btree_magic *magic = (void *)(dblock);
 	size_t ofz_disk = xal_fsbno_offset(xal, fsbno);
@@ -1799,7 +1831,7 @@ process_dinode_dir_extents_dblock(struct xal *xal, uint64_t fsbno, struct xal_in
 
 	XAL_DEBUG("ENTER");
 
-	err = dev_read_into(xal->dev, be->buf, xal->sb.dirblocksize, ofz_disk, dblock);
+	err = read_index_block(xal, ofz_disk, xal->sb.dirblocksize, dblock);
 	if (err) {
 		XAL_DEBUG("FAILED: !dev_read(directory-extent)");
 		return err;
@@ -2095,6 +2127,273 @@ process_ino(struct xal *xal, uint64_t ino, struct xal_inode *self)
 	return 0;
 }
 
+/* Where the leaf section of a directory starts, in bytes (XFS_DIR2_LEAF_OFFSET) */
+#define DIR2_LEAF_OFFSET_NBYTES (32ULL << 30)
+
+struct batch_items {
+	struct batch_item *items;
+	size_t nitems;
+	size_t capacity;
+	size_t limit; ///< Most items the list takes; adding one more fails with -E2BIG
+};
+
+static int
+batch_items_add(struct batch_items *list, uint64_t ofz, uint32_t nbytes)
+{
+	if (list->nitems >= list->limit) {
+		XAL_DEBUG("FAILED: more than %zu blocks to read ahead", list->limit);
+		return -E2BIG;
+	}
+	if (list->nitems == list->capacity) {
+		size_t capacity = list->capacity ? list->capacity * 2 : 1024;
+		struct batch_item *grown = realloc(list->items, capacity * sizeof(*grown));
+
+		if (!grown) {
+			XAL_DEBUG("FAILED: realloc()");
+			return -ENOMEM;
+		}
+		list->items = grown;
+		list->capacity = capacity;
+	}
+	list->items[list->nitems] = (struct batch_item){
+	    .ofz = ofz,
+	    .nbytes = nbytes,
+	    .idx = list->nitems,
+	};
+	list->nitems += 1;
+
+	return 0;
+}
+
+/**
+ * Keep the block read for 'item' at its index in the area 'arg'; a batch_item_fn
+ */
+static int
+dirblocks_store(struct xal *xal, const struct batch_item *item, const uint8_t *data, void *arg)
+{
+	struct xal_be_xfs *be = (struct xal_be_xfs *)&xal->be;
+	struct dirblocks *dirblocks = be->dirblocks;
+	uint8_t *block = (uint8_t *)arg + (size_t)item->idx * xal->sb.dirblocksize;
+	khiter_t iter;
+	int ret;
+
+	memcpy(block, data, item->nbytes);
+
+	iter = kh_put(ofz_to_block, dirblocks->map, item->ofz, &ret);
+	if (ret < 0) {
+		XAL_DEBUG("FAILED: kh_put()");
+		return -ENOMEM;
+	}
+	kh_value(dirblocks->map, iter) = (struct dirblock){.data = block, .nbytes = item->nbytes};
+
+	return 0;
+}
+
+static int
+dirblocks_read_round(struct xal *xal, struct batch_items *list, int round)
+{
+	struct xal_be_xfs *be = (struct xal_be_xfs *)&xal->be;
+	struct dirblocks *dirblocks = be->dirblocks;
+
+	if (!list->nitems) {
+		return 0;
+	}
+
+	dirblocks->areas[round] = malloc(list->nitems * (size_t)xal->sb.dirblocksize);
+	if (!dirblocks->areas[round]) {
+		XAL_DEBUG("FAILED: malloc()");
+		return -ENOMEM;
+	}
+
+	return batch_read(xal, list->items, list->nitems, dirblocks_store, dirblocks->areas[round]);
+}
+
+static void
+dirblocks_free(struct xal *xal)
+{
+	struct xal_be_xfs *be = (struct xal_be_xfs *)&xal->be;
+	struct dirblocks *dirblocks = be->dirblocks;
+
+	if (!dirblocks) {
+		return;
+	}
+
+	if (dirblocks->map) {
+		kh_destroy(ofz_to_block, dirblocks->map);
+	}
+	free(dirblocks->areas[0]);
+	free(dirblocks->areas[1]);
+	free(dirblocks);
+	be->dirblocks = NULL;
+}
+
+/**
+ * Read ahead the blocks process_ino() will read for the directories, so that the index finds them
+ * in memory
+ *
+ * For an extents-format directory these are the blocks its extents list up to its size, as
+ * process_dinode_dir_extents() reads them. For a btree-format directory whose root is at level 1
+ * they are the bmbt leaves the root points at, read first, and then the blocks of the data section
+ * those leaves list. Blocks not read here are read when the index asks for them: the first block
+ * of a leaf section, which the walk reads to find where the data section ends, and the bmbt
+ * blocks of files.
+ */
+static int
+dirblocks_read(struct xal *xal)
+{
+	struct xal_be_xfs *be = (struct xal_be_xfs *)&xal->be;
+	khash_t(ino_to_dinode) *dinodes_map = be->dinodes_map;
+	const uint32_t fsblk_per_dblk = xal->sb.dirblocksize / xal->sb.blocksize;
+	const uint64_t leaf_fsblk = DIR2_LEAF_OFFSET_NBYTES / xal->sb.blocksize;
+	const size_t litino = xal->sb.inodesize - sizeof(struct xal_odf_dinode);
+	/* Hold no more bytes of directory blocks than be->dinodes holds of inodes */
+	const size_t limit = xal->sb.nallocated * xal->sb.inodesize / xal->sb.dirblocksize;
+	struct batch_items blocks = {.limit = limit}, leaves = {.limit = limit};
+	struct dirblocks *dirblocks;
+	size_t maxrecs;
+	int err = 0;
+
+	dirblocks = calloc(1, sizeof(*dirblocks));
+	if (!dirblocks) {
+		XAL_DEBUG("FAILED: calloc()");
+		return -ENOMEM;
+	}
+	be->dirblocks = dirblocks;
+
+	dirblocks->map = kh_init(ofz_to_block);
+	if (!dirblocks->map) {
+		XAL_DEBUG("FAILED: kh_init()");
+		err = -ENOMEM;
+		goto exit;
+	}
+
+	for (khiter_t k = kh_begin(dinodes_map); k != kh_end(dinodes_map) && !err; ++k) {
+		struct xal_odf_dinode *dinode;
+		size_t dsize;
+		void *dfork;
+
+		if (!kh_exist(dinodes_map, k)) {
+			continue;
+		}
+		dinode = kh_value(dinodes_map, k);
+		if (be16toh(dinode->di_magic) != XAL_DINODE_MAGIC ||
+		    !S_ISDIR(be16toh(dinode->di_mode))) {
+			continue;
+		}
+		dfork = ((uint8_t *)dinode) + sizeof(*dinode);
+
+		/* The size of the data fork, as XFS_DFORK_DSIZE() gives it; this reads every
+		 * directory in the inobt, also those the walk does not reach */
+		dsize = dinode->di_forkoff ? dinode->di_forkoff * 8UL : litino;
+		if (dsize > litino) {
+			continue;
+		}
+
+		if (dinode->di_format == XAL_DINODE_FMT_EXTENTS) {
+			struct pair_u64 *extents = dfork;
+			uint64_t nextents = be32toh(dinode->di_nextents);
+			int64_t nbytes = be64toh(dinode->size);
+
+			if (!nextents) {
+				nextents = be64toh(dinode->di_big_nextents);
+			}
+			if (nextents > dsize / sizeof(*extents)) {
+				continue;
+			}
+			for (uint64_t i = 0; (nbytes > 0) && (i < nextents) && !err; ++i) {
+				struct xal_extent extent = {0};
+
+				decode_xfs_extent(be64toh(extents[i].l0), be64toh(extents[i].l1),
+						  &extent);
+				/* Up to the directory's size, which on a consistent directory is
+				 * where the walk stops too, at the end of an extent */
+				for (size_t fsblk = 0;
+				     fsblk < extent.nblocks &&
+				     (int64_t)(fsblk * xal->sb.blocksize) < nbytes && !err;
+				     fsblk += fsblk_per_dblk) {
+					err = batch_items_add(
+					    &blocks,
+					    xal_fsbno_offset(xal, extent.start_block + fsblk),
+					    xal->sb.dirblocksize);
+				}
+				nbytes -= extent.nblocks * xal->sb.blocksize;
+			}
+		} else if (dinode->di_format == XAL_DINODE_FMT_BTREE &&
+			   be16toh(((uint16_t *)dfork)[0]) == 1) {
+			/* A header, the keys, then the pointers, as in xfs_bmdr_maxrecs() */
+			size_t rootrecs = (dsize - 4) / 16;
+			uint16_t numrecs = be16toh(((uint16_t *)dfork)[1]);
+			const uint8_t *fsbnos = (uint8_t *)dfork + 4 + rootrecs * 8;
+
+			if (!numrecs || numrecs > rootrecs) {
+				continue;
+			}
+			for (uint16_t rec = 0; rec < numrecs && !err; ++rec) {
+				uint64_t fsbno, ofz;
+
+				/* The pointers sit at a 4-byte offset of the 8-byte aligned fork */
+				memcpy(&fsbno, fsbnos + rec * sizeof(fsbno), sizeof(fsbno));
+				ofz = xal_fsbno_offset(xal, be64toh(fsbno));
+				err = batch_items_add(&leaves, ofz, xal->sb.blocksize);
+				if (!err) {
+					err = batch_items_add(&blocks, ofz, xal->sb.blocksize);
+				}
+			}
+		}
+	}
+	if (!err) {
+		err = dirblocks_read_round(xal, &blocks, 0);
+	}
+
+	/* The leaves are in memory now; gather the blocks they list for a second round */
+	blocks.limit = limit - blocks.nitems;
+	blocks.nitems = 0;
+	maxrecs = (xal->sb.blocksize - sizeof(struct xal_odf_btree_lfmt)) / sizeof(struct pair_u64);
+	for (size_t i = 0; i < leaves.nitems && !err; ++i) {
+		khiter_t iter = kh_get(ofz_to_block, dirblocks->map, leaves.items[i].ofz);
+		struct xal_odf_btree_lfmt *leaf;
+		struct pair_u64 *pairs;
+
+		if (iter == kh_end(dirblocks->map)) {
+			continue;
+		}
+		leaf = (void *)kh_value(dirblocks->map, iter).data;
+		pairs = (void *)(((uint8_t *)leaf) + sizeof(*leaf));
+		if (be32toh(leaf->magic.num) != XAL_ODF_BMAP_CRC_MAGIC ||
+		    be16toh(leaf->pos.level) || be16toh(leaf->pos.numrecs) > maxrecs) {
+			continue;
+		}
+
+		for (uint16_t rec = 0; rec < be16toh(leaf->pos.numrecs) && !err; ++rec) {
+			struct xal_extent extent = {0};
+
+			decode_xfs_extent(be64toh(pairs[rec].l0), be64toh(pairs[rec].l1), &extent);
+			/* The records are sorted by offset; the rest are of the leaf section */
+			if (extent.start_offset >= leaf_fsblk) {
+				break;
+			}
+			for (size_t fsblk = 0; fsblk < extent.nblocks && !err;
+			     fsblk += fsblk_per_dblk) {
+				err = batch_items_add(
+				    &blocks, xal_fsbno_offset(xal, extent.start_block + fsblk),
+				    xal->sb.dirblocksize);
+			}
+		}
+	}
+	if (!err) {
+		err = dirblocks_read_round(xal, &blocks, 1);
+	}
+
+exit:
+	free(blocks.items);
+	free(leaves.items);
+	if (err) {
+		dirblocks_free(xal);
+	}
+
+	return err;
+}
+
 int
 xal_be_xfs_index(struct xal *xal)
 {
@@ -2104,6 +2403,12 @@ xal_be_xfs_index(struct xal *xal)
 
 	if (!be->dinodes) {
 		return -EINVAL;
+	}
+
+	/* Before the pools are cleared, and best effort: the walk reads what is not read ahead */
+	err = dirblocks_read(xal);
+	if (err) {
+		XAL_DEBUG("INFO: dirblocks_read(); err(%d), reading the blocks one at a time", err);
 	}
 
 	atomic_store(xal->index_state, XAL_STATE_INDEXING);
@@ -2135,6 +2440,7 @@ xal_be_xfs_index(struct xal *xal)
 	}
 
 exit:
+	dirblocks_free(xal);
 	atomic_fetch_add(xal->seq_lock, 1);
 	xal_mark_index_done(xal, err);
 

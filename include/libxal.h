@@ -365,6 +365,10 @@ xal_dinodes_retrieve(struct xal *xal);
  * Assumes that you have retrieved all the inodes from disk via xal_dinodes_retrieve() if opened with
  * backend XAL_BACKEND_XFS.
  *
+ * With XAL_BACKEND_XFS the blocks of every directory are read ahead the way xal_dinodes_retrieve()
+ * reads the inode chunks, before the previous index is cleared, and held in memory until this
+ * returns; when that fails, the walk reads them one at a time instead.
+ *
  * Only directories and regular files are indexed; symlinks and special files are skipped, and so
  * is anything mounted inside the tree with XAL_BACKEND_FIEMAP. That backend also checks the
  * mountpoint and opts->subtree again, as xal_open() does.
