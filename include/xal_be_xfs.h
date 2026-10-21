@@ -24,6 +24,8 @@ struct xal_ag {
 struct xal_be_xfs_tree {
 	char *subtree;	   ///< opts.subtree, normalized; NULL for the whole filesystem
 	uint64_t root_ino; ///< Inode the index is rooted at: sb.rootino or the subtree's
+	uint64_t headers;  ///< Hash of the AG headers as xal_open() read them, which
+			   ///< xal_index_save() and xal_index_load() require them still to be
 };
 
 struct xal_be_xfs {

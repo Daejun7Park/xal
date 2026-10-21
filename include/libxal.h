@@ -368,6 +368,8 @@ xal_close(struct xal *xal);
  * of the directories, then the inodes their entries name, the same way. xal_index() reads any
  * the levels did not, as it gets to them.
  *
+ * -EBUSY is returned while xal_index(), xal_index_save() or xal_index_load() runs on the handle.
+ *
  * @param xal Pointer to the xal
  *
  * @returns On success, 0 is returned. On error, negative errno is returned to indicate the error.
@@ -399,7 +401,8 @@ xal_dinodes_retrieve(struct xal *xal);
  * way to.
  *
  * Takes exactly one caller at a time. A second concurrent call on the same handle returns
- * -EBUSY rather than interleaving, and the watch callback installed by xal_watch_filesystem()
+ * -EBUSY rather than interleaving, as does a call while xal_dinodes_retrieve(), xal_index_save()
+ * or xal_index_load() runs on it, and the watch callback installed by xal_watch_filesystem()
  * counts as a caller: a caller that re-indexes from its own thread as well should expect one of
  * the two to be refused. Interleaved indexes are not merely wasteful -- they can produce extents
  * that were never a file's, from a call that reports success.
@@ -414,6 +417,62 @@ xal_dinodes_retrieve(struct xal *xal);
  */
 int
 xal_index(struct xal *xal);
+
+/**
+ * Write the index to the file at 'path', for xal_index_load() to read back
+ *
+ * XAL_BACKEND_XFS only. The file is written next to 'path' with mode 0600, as it names every file
+ * on the filesystem, synced, and renamed over 'path'. It holds the inode and extent pools and a
+ * key of the filesystem's state: the UUID, the LSN and CRC of the unmount record at the head of
+ * the log, and a hash of the superblock and the AG headers.
+ *
+ * Any mount of the device, read-only ones included, rewrites the superblock and writes a new
+ * unmount record when it is unmounted, unless it used -o norecovery or the block device was
+ * read-only. So the key changes with any change made through the filesystem, and also with a
+ * mount that changed nothing; after a crash the log is not clean. Offline tools are seen only
+ * when they write the superblock or an AG header: xfs_admin does, and xfs_repair usually
+ * rewrites the AG headers. Writes to inodes or directory blocks with xfs_db -x or to the raw
+ * device are not seen. Only v5 filesystems with an internal log are supported. The file is in
+ * the host's byte order; a host of the other order refuses it.
+ *
+ * The superblock and the AG headers must still be as xal_open() read them; -ESTALE otherwise, as
+ * the inodes may have been read after a change.
+ *
+ * @param xal Pointer to the xal, indexed
+ * @param path Path of the file to write
+ *
+ * @returns On success, 0 is returned. -ESTALE is returned when the filesystem changed since its
+ * inodes were read or the log cannot be read as clean, -EUCLEAN when the log is not clean,
+ * -ENODATA when its last record is the one xfsprogs writes when it formats a log (mkfs,
+ * xfs_repair -L; mount and unmount the filesystem once), -EOPNOTSUPP for an external log or a
+ * filesystem older than v5, -EBUSY while xal_dinodes_retrieve(), xal_index() or
+ * xal_index_load() runs, -EINVAL without an index; other negative errno on error.
+ */
+int
+xal_index_save(struct xal *xal, const char *path);
+
+/**
+ * Read an index written by xal_index_save() in place of xal_dinodes_retrieve() and xal_index()
+ *
+ * XAL_BACKEND_XFS only. The file must be a regular file owned by the effective user and not
+ * writable by group or others, and must not be a symlink. The key in it is compared with the
+ * filesystem's state read from the device now, and the subtree with the handle's opts.subtree.
+ * On success the index is as after xal_index(), and the inodes of an earlier
+ * xal_dinodes_retrieve() are dropped, so a later xal_index() needs xal_dinodes_retrieve() first.
+ * When the file is refused, the handle's index is left as it was; on an error after the key
+ * matched, such as pools that turn out damaged (-EPROTO), the handle has no index.
+ *
+ * @param xal Pointer to the xal, opened on the device
+ * @param path Path of the file to read
+ *
+ * @returns On success, 0 is returned. -ESTALE is returned when the filesystem or the subtree
+ * differs from the one saved, or the filesystem changed since xal_open() (open it again),
+ * -EUCLEAN, -ENODATA and -EOPNOTSUPP as for xal_index_save(), -EPERM for a file others can
+ * write, -EPROTO for a file this build does not read or a damaged one, -EBUSY while
+ * xal_dinodes_retrieve(), xal_index() or xal_index_save() runs; other negative errno on error.
+ */
+int
+xal_index_load(struct xal *xal, const char *path);
 
 /**
  * Callback invoked by the background watch thread when it observes the xal struct becoming
