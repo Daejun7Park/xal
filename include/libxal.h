@@ -369,6 +369,8 @@ xal_close(struct xal *xal);
  * the levels did not, as it gets to them.
  *
  * -EBUSY is returned while xal_index(), xal_index_save() or xal_index_load() runs on the handle.
+ * -EUCLEAN is returned for inode btree records out of bounds or order, and -EOPNOTSUPP for a
+ * filesystem with more inodes in a block than in a chunk (64).
  *
  * @param xal Pointer to the xal
  *

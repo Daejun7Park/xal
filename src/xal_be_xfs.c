@@ -27,6 +27,47 @@ struct pair_u64 {
 
 KHASH_MAP_INIT_INT64(ino_to_dinode, struct xal_odf_dinode *);
 
+/* An inode chunk from the inobt, read once all of them are known */
+struct chunk {
+	uint64_t ofz;	    ///< Byte offset of the chunk on the device
+	uint64_t startino;  ///< Number of its first inode
+	uint64_t allocated; ///< Bit per inode, set when it is allocated: not free, not in a hole
+	size_t base;	    ///< Index in be->dinodes of its first allocated inode
+};
+
+/**
+ * How an inode is found in be->dinodes, which be->dinodes_map points at
+ *
+ * After the inobt walk the inodes are in be->dinodes in the order of their numbers, as the
+ * chunks list them, so an inode is found by its chunk, and its rank among the allocated inodes
+ * there. A subtree is read without the inobt, in no such order, and its inodes go in a map.
+ */
+struct dinodes_index {
+	struct chunk *chunks; ///< Sorted by startino; NULL with a subtree
+	size_t nchunks;
+	khash_t(ino_to_dinode) * map; ///< NULL without a subtree
+	size_t ndinodes;	      ///< Inodes in be->dinodes
+};
+
+/* Free be->dinodes and what finds an inode there */
+static void
+dinodes_free(struct xal *xal)
+{
+	struct xal_be_xfs *be = (struct xal_be_xfs *)&xal->be;
+	struct dinodes_index *index = be->dinodes_map;
+
+	if (index) {
+		if (index->map) {
+			kh_destroy(ino_to_dinode, index->map);
+		}
+		free(index->chunks);
+		free(index);
+		be->dinodes_map = NULL;
+	}
+	free(be->dinodes);
+	be->dinodes = NULL;
+}
+
 /* A block read ahead by dirblocks_read(): its bytes and how many of them were read */
 struct dirblock {
 	uint8_t *data;
@@ -474,10 +515,7 @@ xal_be_xfs_close(struct xal *xal)
 		xnvme_buf_free(xal->dev, be->buf);
 	}
 
-	if (be->dinodes_map) {
-		kh_destroy(ino_to_dinode, be->dinodes_map);
-	}
-	free(be->dinodes);
+	dinodes_free(xal);
 	dirblocks_free(xal);
 	if (be->tree) {
 		free(be->tree->subtree);
@@ -605,18 +643,12 @@ read_iab3_block(struct xal *xal, struct xal_ag *ag, uint64_t blkno, void *buf)
 	return 0;
 }
 
-/* An inode chunk from the inobt, to be read once all of them are known */
-struct chunk {
-	uint64_t ofz;	   ///< Byte offset of the chunk on the device
-	uint64_t free;	   ///< Bit per inode, set when the inode is free
-	uint16_t holemask; ///< Bit per four inodes, set when they are not allocated (sparse)
-};
-
+/* The chunks the inobt walk gathers, in the order of their inode numbers */
 struct chunks {
 	struct chunk *chunks;
 	size_t nchunks;
 	size_t capacity;
-	uint64_t ninodes; ///< Allocated inodes copied into be->dinodes so far
+	uint64_t ninodes; ///< Allocated inodes in the chunks gathered so far
 };
 
 static int
@@ -626,8 +658,15 @@ decode_iab3_leaf_records(struct xal *xal, struct xal_ag *ag, void *buf, struct c
 
 	XAL_DEBUG("ENTER");
 
+	if (root->pos.numrecs >
+	    (xal->sb.blocksize - sizeof(*root)) / sizeof(struct xal_odf_inobt_rec)) {
+		XAL_DEBUG("FAILED: inobt leaf numrecs(%" PRIu16 ")", root->pos.numrecs);
+		return -EUCLEAN;
+	}
+
 	for (uint16_t reci = 0; reci < root->pos.numrecs; ++reci) {
 		struct xal_odf_inobt_rec *rec;
+		uint64_t startino, allocated, holes;
 		uint32_t agbino;
 		uint64_t agbno;
 
@@ -645,12 +684,15 @@ decode_iab3_leaf_records(struct xal *xal, struct xal_ag *ag, void *buf, struct c
 		 */
 		xal_ino_decode_relative(xal, rec->startino, &agbno, &agbino);
 
-		/**
-		 * Assumption: if the inode-offset is non-zero, then offset-calucations are
-		 *             incorrect as they do not account for the only the block where the
-		 *             inode-chunk is supposed to start.
-		 */
-		assert(agbino == 0);
+		/* A chunk starts on a multiple of its inodes; one that does not start a block
+		 * (more than CHUNK_NINO inodes in a block) is not handled */
+		if (rec->startino % CHUNK_NINO) {
+			XAL_DEBUG("FAILED: inobt startino(0x%" PRIx32 ")", rec->startino);
+			return -EUCLEAN;
+		}
+		if (agbino) {
+			return -EOPNOTSUPP;
+		}
 
 		if (chunks->nchunks == chunks->capacity) {
 			size_t capacity = chunks->capacity ? chunks->capacity * 2 : 1024;
@@ -663,11 +705,33 @@ decode_iab3_leaf_records(struct xal *xal, struct xal_ag *ag, void *buf, struct c
 			chunks->chunks = grown;
 			chunks->capacity = capacity;
 		}
+		startino =
+		    ((uint64_t)ag->seqno << (xal->sb.agblklog + xal->sb.inopblog)) | rec->startino;
+		if (chunks->nchunks && startino <= chunks->chunks[chunks->nchunks - 1].startino) {
+			XAL_DEBUG("FAILED: inobt record startino(0x%" PRIx64 ") out of order",
+				  startino);
+			return -EUCLEAN;
+		}
+		/* The holes of a sparse chunk are free too, as xchk_iallocbt_rec() checks */
+		holes = 0;
+		for (int bit = 0; bit < 16; ++bit) {
+			if ((rec->holemask >> bit) & 1) {
+				holes |= 0xfULL << (bit * 4);
+			}
+		}
+		if ((rec->free & holes) != holes) {
+			XAL_DEBUG("FAILED: inobt record startino(0x%" PRIx64 ") holes not free",
+				  startino);
+			return -EUCLEAN;
+		}
+		allocated = ~rec->free;
 		chunks->chunks[chunks->nchunks++] = (struct chunk){
 		    .ofz = agbno * xal->sb.blocksize + ag->offset,
-		    .free = rec->free,
-		    .holemask = rec->holemask,
+		    .startino = startino,
+		    .allocated = allocated,
+		    .base = chunks->ninodes,
 		};
+		chunks->ninodes += __builtin_popcountll(allocated);
 	}
 
 	XAL_DEBUG("EXIT");
@@ -676,48 +740,23 @@ decode_iab3_leaf_records(struct xal *xal, struct xal_ag *ag, void *buf, struct c
 }
 
 /**
- * Copy the allocated inodes of the chunk read for 'item' into be->dinodes; a batch_item_fn
+ * Copy the allocated inodes of the chunk read for 'item' to its place in be->dinodes; a
+ * batch_item_fn
  */
 static int
 decode_chunk(struct xal *xal, const struct batch_item *item, const uint8_t *data, void *arg)
 {
 	struct xal_be_xfs *be = (struct xal_be_xfs *)&xal->be;
-	khash_t(ino_to_dinode) *dinodes_map = be->dinodes_map;
 	struct chunks *chunks = arg;
 	const struct chunk *chunk = &chunks->chunks[item->idx];
+	uint8_t *dinode = &be->dinodes[chunk->base * xal->sb.inodesize];
 
-	/**
-	 * Traverse the inodes in the chunk, skipping unused and free inodes.
-	 */
 	for (uint8_t chunk_index = 0; chunk_index < CHUNK_NINO; ++chunk_index) {
-		const uint8_t *chunk_cursor = &data[chunk_index * xal->sb.inodesize];
-		uint64_t is_unused = (chunk->holemask >> (chunk_index / 4)) & 1;
-		uint64_t is_free = (chunk->free & (1ULL << chunk_index)) >> chunk_index;
-		struct xal_odf_dinode *dinode;
-		khiter_t iter;
-		int err;
-
-		if (is_unused || is_free) {
+		if (!((chunk->allocated >> chunk_index) & 1)) {
 			continue;
 		}
-
-		if (chunks->ninodes == xal->sb.nallocated) {
-			XAL_DEBUG("FAILED: more allocated inodes than the AGIs count(%" PRIu64 ")",
-				  xal->sb.nallocated);
-			return -EINVAL;
-		}
-
-		dinode = (void *)&be->dinodes[chunks->ninodes * xal->sb.inodesize];
-		memcpy(dinode, chunk_cursor, xal->sb.inodesize);
-
-		iter = kh_put(ino_to_dinode, dinodes_map, be64toh(dinode->ino), &err);
-		if (err < 0) {
-			XAL_DEBUG("FAILED: kh_put()");
-			return -EIO;
-		}
-		kh_value(dinodes_map, iter) = dinode;
-
-		chunks->ninodes += 1;
+		memcpy(dinode, &data[chunk_index * xal->sb.inodesize], xal->sb.inodesize);
+		dinode += xal->sb.inodesize;
 	}
 
 	return 0;
@@ -732,12 +771,16 @@ decode_iab3_node_records(struct xal *xal, struct xal_ag *ag, void *buf, struct c
 	uint32_t pointers[ODF_BLOCK_FS_BYTES_MAX / sizeof(uint32_t)] = {0};
 	struct xal_odf_btree_sfmt *node = (void *)buf;
 	uint8_t *cursor = buf;
-	size_t pointers_ofz;
+	size_t pointers_ofz, maxrecs;
 	int err;
 
 	XAL_DEBUG("ENTER");
 
-	btree_sblock_meta(xal, NULL, NULL, &pointers_ofz);
+	btree_sblock_meta(xal, &maxrecs, NULL, &pointers_ofz);
+	if (node->pos.numrecs > maxrecs) {
+		XAL_DEBUG("FAILED: inobt node numrecs(%" PRIu16 ")", node->pos.numrecs);
+		return -EUCLEAN;
+	}
 
 	memcpy(&pointers, cursor + pointers_ofz, xal->sb.blocksize - pointers_ofz);
 
@@ -810,25 +853,36 @@ static int
 dinodes_retrieve(struct xal *xal)
 {
 	struct xal_be_xfs *be = (struct xal_be_xfs *)&xal->be;
+	struct dinodes_index *index;
 	struct chunks chunks = {0};
 	struct batch_item *items = NULL;
 	int err = 0;
 
 	XAL_DEBUG("ENTER");
 
-	be->dinodes_map = kh_init(ino_to_dinode);
-	if (!be->dinodes_map) {
-		XAL_DEBUG("FAILED: kh_init()");
-		return -EINVAL;
+	dinodes_free(xal);
+
+	index = calloc(1, sizeof(*index));
+	if (!index) {
+		XAL_DEBUG("FAILED: calloc()");
+		return -ENOMEM;
 	}
+	be->dinodes_map = index;
 
 	be->dinodes = calloc(1, xal->sb.nallocated * xal->sb.inodesize);
 	if (!be->dinodes) {
 		XAL_DEBUG("FAILED: calloc()");
-		return -errno;
+		err = -ENOMEM;
+		goto exit;
 	}
 
 	if (be->tree->subtree) {
+		index->map = kh_init(ino_to_dinode);
+		if (!index->map) {
+			XAL_DEBUG("FAILED: kh_init()");
+			err = -ENOMEM;
+			goto exit;
+		}
 		err = subtree_read(xal);
 		goto exit;
 	}
@@ -848,6 +902,12 @@ dinodes_retrieve(struct xal *xal)
 	if (err) {
 		goto exit;
 	}
+	if (chunks.ninodes > xal->sb.nallocated) {
+		XAL_DEBUG("FAILED: more allocated inodes than the AGIs count(%" PRIu64 ")",
+			  xal->sb.nallocated);
+		err = -EUCLEAN;
+		goto exit;
+	}
 
 	items = calloc(chunks.nchunks ? chunks.nchunks : 1, sizeof(*items));
 	if (!items) {
@@ -865,7 +925,12 @@ dinodes_retrieve(struct xal *xal)
 	err = batch_read(xal, items, chunks.nchunks, decode_chunk, &chunks);
 	if (err) {
 		XAL_DEBUG("FAILED: batch_read(chunks); err(%d)", err);
+		goto exit;
 	}
+	index->chunks = chunks.chunks;
+	index->nchunks = chunks.nchunks;
+	index->ndinodes = chunks.ninodes;
+	chunks.chunks = NULL;
 
 exit:
 	free(items);
@@ -873,8 +938,7 @@ exit:
 
 	if (err) {
 		dirblocks_free(xal);
-		free(be->dinodes);
-		be->dinodes = NULL;
+		dinodes_free(xal);
 		return err;
 	}
 
@@ -938,21 +1002,49 @@ static int
 dinodes_get(struct xal *xal, uint64_t ino, void **dinode)
 {
 	struct xal_be_xfs *be = (struct xal_be_xfs *)&xal->be;
-	kh_ino_to_dinode_t *dinode_map = be->dinodes_map;
-	khiter_t iter;
+	struct dinodes_index *index = be->dinodes_map;
+	struct xal_odf_dinode *found;
+	const struct chunk *chunk;
+	size_t lo = 0, hi = index->nchunks;
+	uint64_t offset;
 
-	iter = kh_get(ino_to_dinode, dinode_map, ino);
-	if (iter == kh_end(dinode_map)) {
+	if (index->map) {
+		khiter_t iter = kh_get(ino_to_dinode, index->map, ino);
+
 		/* Not read ahead by subtree_read(); without an inobt walk that is no error */
-		if (be->tree->subtree) {
+		if (iter == kh_end(index->map)) {
 			return dinode_read(xal, ino, (struct xal_odf_dinode **)dinode);
 		}
-		XAL_DEBUG("FAILED: kh_get(0x%" PRIx64 ")", ino);
+		*dinode = kh_val(index->map, iter);
+		return 0;
+	}
+
+	/* The last chunk starting at or before 'ino' */
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+
+		if (index->chunks[mid].startino <= ino) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	chunk = lo ? &index->chunks[lo - 1] : NULL;
+	offset = chunk ? ino - chunk->startino : CHUNK_NINO;
+	if (offset >= CHUNK_NINO || !((chunk->allocated >> offset) & 1)) {
+		XAL_DEBUG("FAILED: no allocated inode(0x%" PRIx64 ")", ino);
 		return -EINVAL;
 	}
 
-	XAL_DEBUG("INFO: found ino(0x%" PRIx64 ")", ino);
-	*dinode = kh_val(dinode_map, iter);
+	found = (void *)&be->dinodes[(chunk->base + __builtin_popcountll(chunk->allocated &
+									 ((1ULL << offset) - 1))) *
+				     xal->sb.inodesize];
+	/* The rank is only as good as the inobt record; the inode says which it is */
+	if (be16toh(found->di_magic) != XAL_DINODE_MAGIC || be64toh(found->ino) != ino) {
+		XAL_DEBUG("FAILED: the inode in the place of ino(0x%" PRIx64 ") is another", ino);
+		return -EUCLEAN;
+	}
+	*dinode = found;
 
 	return 0;
 }
@@ -2609,7 +2701,7 @@ static int
 dirblocks_read(struct xal *xal)
 {
 	struct xal_be_xfs *be = (struct xal_be_xfs *)&xal->be;
-	khash_t(ino_to_dinode) *dinodes_map = be->dinodes_map;
+	struct dinodes_index *index = be->dinodes_map;
 	/* Hold no more bytes of directory blocks than be->dinodes holds of inodes */
 	const size_t limit = xal->sb.nallocated * xal->sb.inodesize / xal->sb.dirblocksize;
 	struct dinode_list dirs = {0};
@@ -2620,13 +2712,9 @@ dirblocks_read(struct xal *xal)
 		return err;
 	}
 
-	for (khiter_t k = kh_begin(dinodes_map); k != kh_end(dinodes_map) && !err; ++k) {
-		struct xal_odf_dinode *dinode;
+	for (size_t i = 0; i < index->ndinodes && !err; ++i) {
+		struct xal_odf_dinode *dinode = (void *)&be->dinodes[i * xal->sb.inodesize];
 
-		if (!kh_exist(dinodes_map, k)) {
-			continue;
-		}
-		dinode = kh_value(dinodes_map, k);
 		if (S_ISDIR(be16toh(dinode->di_mode))) {
 			err = dinode_list_add(&dirs, dinode);
 		}
@@ -2918,12 +3006,13 @@ static int
 dinode_store(struct xal *xal, const struct batch_item *item, const uint8_t *data, void *arg)
 {
 	struct xal_be_xfs *be = (struct xal_be_xfs *)&xal->be;
-	khash_t(ino_to_dinode) *dinodes_map = be->dinodes_map;
+	struct dinodes_index *index = be->dinodes_map;
+	khash_t(ino_to_dinode) *dinodes_map = index->map;
 	struct dinodes_read_args *args = arg;
 	uint64_t ino = args->inos[item->idx];
 	const struct xal_odf_dinode *src;
 	struct xal_odf_dinode *dinode;
-	size_t ndinodes = kh_size(dinodes_map);
+	size_t ndinodes = index->ndinodes;
 	uint64_t ofz;
 	khiter_t iter;
 	int ret;
@@ -2957,6 +3046,7 @@ dinode_store(struct xal *xal, const struct batch_item *item, const uint8_t *data
 		return -ENOMEM;
 	}
 	kh_value(dinodes_map, iter) = dinode;
+	index->ndinodes += 1;
 
 	if (args->dirs && S_ISDIR(be16toh(dinode->di_mode))) {
 		return dinode_list_add(args->dirs, dinode);
@@ -3007,7 +3097,7 @@ static int
 dinode_read(struct xal *xal, uint64_t ino, struct xal_odf_dinode **dinode)
 {
 	struct xal_be_xfs *be = (struct xal_be_xfs *)&xal->be;
-	khash_t(ino_to_dinode) *dinodes_map = be->dinodes_map;
+	khash_t(ino_to_dinode) *dinodes_map = ((struct dinodes_index *)be->dinodes_map)->map;
 	struct dinodes_read_args args = {.inos = &ino};
 	struct batch_item item;
 	khiter_t iter;
@@ -3120,7 +3210,7 @@ static int
 subtree_entry(struct xal *xal, struct xal_inode *dentry, void *arg)
 {
 	struct xal_be_xfs *be = (struct xal_be_xfs *)&xal->be;
-	khash_t(ino_to_dinode) *dinodes_map = be->dinodes_map;
+	khash_t(ino_to_dinode) *dinodes_map = ((struct dinodes_index *)be->dinodes_map)->map;
 	struct ino_list *list = arg;
 
 	if (dentry->ftype != XAL_ODF_DIR3_FT_UNKNOWN && dentry->ftype != XAL_ODF_DIR3_FT_DIR &&
@@ -3947,12 +4037,7 @@ index_load(struct xal *xal, const char *path)
 
 		/* The inodes are not those of this index; xal_index() needs them read again */
 		dirblocks_free(xal);
-		if (be->dinodes_map) {
-			kh_destroy(ino_to_dinode, be->dinodes_map);
-			be->dinodes_map = NULL;
-		}
-		free(be->dinodes);
-		be->dinodes = NULL;
+		dinodes_free(xal);
 	} else {
 		xal_pool_clear(&xal->inodes);
 		xal_pool_clear(&xal->extents);
