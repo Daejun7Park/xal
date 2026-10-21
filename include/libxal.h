@@ -92,9 +92,13 @@ struct xal_opts {
 	 *  xal_from_shm() for attaching to the pools from another process. */
 	const char *shm_name;
 
-	/** FIEMAP backend only: absolute path at or under the mountpoint to scope the index to.
-	 *  Only files beneath it are indexed, and in XAL_WATCHMODE_REFLINK_SNAPSHOT only those
-	 *  are reflinked. NULL or empty indexes the whole mount. Ignored by the XFS backend. */
+	/** Directory to scope the index to; only files beneath it are indexed, and the index is
+	 *  rooted at it. NULL or empty indexes the whole filesystem. With the FIEMAP backend it is
+	 *  an absolute path at or under the mountpoint, and in XAL_WATCHMODE_REFLINK_SNAPSHOT only
+	 *  the files beneath it are reflinked. With the XFS backend it is an absolute path from the
+	 *  root of the filesystem, such as "/data/train", without '.' or '..' components, and a
+	 *  symlink in it is not followed. xal_open() picks the backend by whether the device is
+	 *  mounted, so set opts.be along with a subtree meant for one of them. */
 	const char *subtree;
 };
 
@@ -312,6 +316,10 @@ xal_pp(struct xal *xal);
  * rejected with -EXDEV, and a mountpoint of / with -EINVAL. The filesystem must stay mounted for
  * as long as the handle is open.
  *
+ * With XAL_BACKEND_XFS, a relative opts->subtree or one with a '.' or '..' component is rejected
+ * with -EINVAL, and one of XAL_PATH_MAXLEN bytes or more with -ENAMETOOLONG; it is looked up by
+ * xal_dinodes_retrieve().
+ *
  * @param dev Pointer to xnvme device handled as retrieved with xnvme_dev_open()
  * @param xal Pointer
  * @param opts Pointer to options, see xal_opts
@@ -351,6 +359,14 @@ xal_close(struct xal *xal);
  * them submitted at once into one buffer of up to 4 MiB from xnvme_buf_alloc(). How many are in
  * flight is up to the device's async interface; without a queue or such a buffer they are read one
  * at a time.
+ *
+ * With XAL_BACKEND_XFS and opts->subtree, the subtree is looked up from the root directory, and
+ * -ENOENT is returned when a component of it is not there, -ENOTDIR when one is not a directory
+ * (a symlink included), -ENOSYS when one is a btree directory above level 1 as for xal_index(),
+ * and -EUCLEAN when one is not consistent.
+ * Then only the inodes beneath it are read, without the inode btrees: level by level, the blocks
+ * of the directories, then the inodes their entries name, the same way. xal_index() reads any
+ * the levels did not, as it gets to them.
  *
  * @param xal Pointer to the xal
  *

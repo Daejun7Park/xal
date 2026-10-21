@@ -18,13 +18,22 @@ struct xal_ag {
 	uint32_t agi_level;  ///< levels in inode btree
 };
 
+/**
+ * What the index of the XFS backend covers
+ */
+struct xal_be_xfs_tree {
+	char *subtree;	   ///< opts.subtree, normalized; NULL for the whole filesystem
+	uint64_t root_ino; ///< Inode the index is rooted at: sb.rootino or the subtree's
+};
+
 struct xal_be_xfs {
 	struct xal_backend_base base;
 	void *buf;            ///< A single buffer for repetitive IO
 	uint8_t *dinodes;     ///< Array of inodes in on-disk-format
 	void *dinodes_map;    ///< Map of dinodes for O(1) ~ avg. lookup
 	struct xal_ag *ags;   ///< Array of 'agcount' number of allocation-groups
-	void *dirblocks;      ///< Directory blocks read ahead by xal_index(); NULL outside it
+	void *dirblocks;      ///< Directory blocks read ahead for xal_index(); NULL outside it
+	struct xal_be_xfs_tree *tree; ///< Set up by xal_be_xfs_open() and xal_from_shm()
 
 	uint8_t _rsvd[8];
 };
