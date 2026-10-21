@@ -1,12 +1,14 @@
+#define _GNU_SOURCE /* ahead of every header, for mkostemp() */
 #include <asm-generic/errno.h>
 #include <libxnvme.h>
-#define _GNU_SOURCE
+
 #include <assert.h>
 #include <endian.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <khash.h>
 #include <libxal.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -804,22 +806,13 @@ retrieve_dinodes_via_iab3(struct xal *xal, struct xal_ag *ag, uint64_t blkno, st
 	return 0;
 }
 
-int
-xal_dinodes_retrieve(struct xal *xal)
+static int
+dinodes_retrieve(struct xal *xal)
 {
 	struct xal_be_xfs *be = (struct xal_be_xfs *)&xal->be;
 	struct chunks chunks = {0};
 	struct batch_item *items = NULL;
 	int err = 0;
-
-	if (xal->procrole == XAL_PROCROLE_SECONDARY) {
-		return -EINVAL;
-	}
-
-	if (be->base.type != XAL_BACKEND_XFS) {
-		XAL_DEBUG("SKIPPED: Backend is not XFS");
-		return 0;
-	}
 
 	XAL_DEBUG("ENTER");
 
@@ -888,6 +881,31 @@ exit:
 	XAL_DEBUG("EXIT");
 
 	return 0;
+}
+
+int
+xal_dinodes_retrieve(struct xal *xal)
+{
+	struct xal_be_xfs *be = (struct xal_be_xfs *)&xal->be;
+	int err;
+
+	if (xal->procrole == XAL_PROCROLE_SECONDARY) {
+		return -EINVAL;
+	}
+
+	if (be->base.type != XAL_BACKEND_XFS) {
+		XAL_DEBUG("SKIPPED: Backend is not XFS");
+		return 0;
+	}
+
+	/* Not while xal_index(), xal_index_save() or xal_index_load() uses the inodes or be->buf */
+	if (atomic_exchange(&xal->indexing, true)) {
+		return -EBUSY;
+	}
+	err = dinodes_retrieve(xal);
+	atomic_store(&xal->indexing, false);
+
+	return err;
 }
 
 /**
@@ -1085,6 +1103,20 @@ retrieve_and_decode_primary_superblock(struct xnvme_dev *dev, void *buf, struct 
 	return 0;
 }
 
+#define FNV1A_BASIS 0xcbf29ce484222325ULL
+#define FNV1A_PRIME 0x100000001b3ULL
+
+static uint64_t
+fnv1a(uint64_t hash, const uint8_t *buf, size_t nbytes)
+{
+	for (size_t i = 0; i < nbytes; ++i) {
+		hash ^= buf[i];
+		hash *= FNV1A_PRIME;
+	}
+
+	return hash;
+}
+
 /**
  * Take opts.subtree as the XFS backend indexes it: an absolute path from the root of the
  * filesystem, stored without repeated or trailing slashes, and NULL when it names the root
@@ -1194,6 +1226,7 @@ xal_be_xfs_open(struct xnvme_dev *dev, struct xal **xal, struct xal_opts *opts)
 		goto failed;
 	}
 
+	be->tree->headers = FNV1A_BASIS;
 	for (uint32_t seqno = 0; seqno < cand->sb.agcount; ++seqno) {
 		err = retrieve_and_decode_allocation_group(dev, buf, seqno, cand);
 		if (err) {
@@ -1203,6 +1236,9 @@ xal_be_xfs_open(struct xnvme_dev *dev, struct xal **xal, struct xal_opts *opts)
 		}
 
 		cand->sb.nallocated += be->ags[seqno].agi_count;
+
+		/* The bytes index_key_get() hashes, as they are before any inode is read */
+		be->tree->headers = fnv1a(be->tree->headers, buf, (size_t)cand->sb.sectsize * 4);
 	}
 
 	if (opts->shm_name) {
@@ -3245,6 +3281,720 @@ exit:
 	dirblocks_free(xal);
 	atomic_fetch_add(xal->seq_lock, 1);
 	xal_mark_index_done(xal, err);
+
+	return err;
+}
+
+/* What xal_index_save() records of the filesystem's state, and xal_index_load() compares */
+struct index_key {
+	uint8_t uuid[16]; ///< sb_uuid
+	uint64_t log_lsn; ///< LSN of the unmount record at the head of the log
+	uint32_t log_crc; ///< Its CRC
+	uint32_t _rsvd;
+	uint64_t headers; ///< FNV-1a of each AG's four header sectors, the primary superblock first
+};
+
+#define INDEX_FILE_MAGIC "XALINDEX"
+#define INDEX_FILE_VERSION 1
+
+/* What xal_index_save() writes ahead of the inode and extent pools */
+struct index_file_hdr {
+	char magic[8];		///< INDEX_FILE_MAGIC
+	uint32_t version;	///< INDEX_FILE_VERSION
+	uint32_t shm_version;	///< XAL_SHM_VERSION, which also covers what the pools mean
+	uint32_t hdr_nbytes;	///< sizeof(struct index_file_hdr)
+	uint32_t inode_nbytes;	///< sizeof(struct xal_inode)
+	uint32_t extent_nbytes; ///< sizeof(struct xal_extent)
+	uint32_t root_idx;
+	uint64_t ninodes;
+	uint64_t nextents;
+	uint64_t root_ino;
+	uint64_t sum;			   ///< pools_sum() of the inodes, then the extents
+	char subtree[XAL_PATH_MAXLEN + 1]; ///< Empty for the whole filesystem
+	struct index_key key;
+};
+
+/* The tid that xfsprogs gives the unmount record it writes when it formats a log */
+#define LOG_XFSPROGS_TID 0xb0c0d0d0
+
+/* A checksum of 'nbytes' at 'buf', eight bytes at a time in four lanes, for the pools */
+static uint64_t
+pools_sum(uint64_t sum, const uint8_t *buf, size_t nbytes)
+{
+	uint64_t lanes[4] = {sum, sum + 1, sum + 2, sum + 3};
+	size_t i = 0;
+
+	for (; i + sizeof(lanes) <= nbytes; i += sizeof(lanes)) {
+		for (int l = 0; l < 4; ++l) {
+			uint64_t word;
+
+			memcpy(&word, buf + i + l * sizeof(word), sizeof(word));
+			lanes[l] = (lanes[l] ^ word) * FNV1A_PRIME;
+		}
+	}
+
+	return fnv1a(fnv1a(sum, (uint8_t *)lanes, sizeof(lanes)), buf + i, nbytes - i);
+}
+
+/* Copy the log block 'bb' of the log at 'log_ofz' into 'out', reading the LBA it is in */
+static int
+log_bb_read(struct xal *xal, uint64_t log_ofz, uint64_t bb, uint8_t *out)
+{
+	struct xal_be_xfs *be = (struct xal_be_xfs *)&xal->be;
+	const struct xnvme_geo *geo = xnvme_dev_get_geo(xal->dev);
+	uint64_t ofz = log_ofz + bb * XAL_ODF_LOG_BBSIZE;
+	uint64_t lba_ofz = ofz - ofz % geo->lba_nbytes;
+	int err;
+
+	err = dev_read(xal->dev, be->buf, geo->lba_nbytes, lba_ofz);
+	if (err) {
+		XAL_DEBUG("FAILED: dev_read(); err(%d)", err);
+		return err;
+	}
+	memcpy(out, (uint8_t *)be->buf + (ofz - lba_ofz), XAL_ODF_LOG_BBSIZE);
+
+	return 0;
+}
+
+static uint32_t
+log_bb_be32(const uint8_t *bb, size_t ofz)
+{
+	uint32_t val;
+
+	memcpy(&val, bb + ofz, sizeof(val));
+
+	return be32toh(val);
+}
+
+/* The cycle stamped on the log block 'bb', as xlog_get_cycle() reads it */
+static int
+log_bb_cycle(struct xal *xal, uint64_t log_ofz, uint64_t bb, uint32_t *cycle)
+{
+	uint8_t block[XAL_ODF_LOG_BBSIZE];
+	int err;
+
+	err = log_bb_read(xal, log_ofz, bb, block);
+	if (err) {
+		return err;
+	}
+	*cycle = log_bb_be32(block, 0) == XAL_ODF_LOG_HEADER_MAGIC
+		     ? log_bb_be32(block, XAL_ODF_LOG_H_CYCLE)
+		     : log_bb_be32(block, 0);
+
+	return 0;
+}
+
+/**
+ * Find the head of a log of 'nbbs' blocks at 'log_ofz': the first block of the latest cycle's
+ * end, as xlog_find_head() finds it in a log without holes from torn writes
+ *
+ * Block 0 carries the cycle 'cycle'. The head is where the cycle drops by one, or turns to zero
+ * in a log not yet written to its end, or block 0 when the whole log carries one cycle.
+ */
+static int
+log_find_head(struct xal *xal, uint64_t log_ofz, uint64_t nbbs, uint64_t *head, uint32_t *cycle)
+{
+	uint32_t first, last, mid_cycle;
+	uint64_t lo = 0, hi = nbbs - 1;
+	int err;
+
+	err = log_bb_cycle(xal, log_ofz, 0, &first);
+	if (!err) {
+		err = log_bb_cycle(xal, log_ofz, nbbs - 1, &last);
+	}
+	if (err) {
+		return err;
+	}
+	if (!first) {
+		XAL_DEBUG("FAILED: the log is zeroed");
+		return -ESTALE;
+	}
+	*cycle = first;
+	if (first == last) {
+		*head = 0;
+		return 0;
+	}
+	if (last && last + 1 != first) {
+		XAL_DEBUG("FAILED: log cycles first(%" PRIu32 ") last(%" PRIu32 ")", first, last);
+		return -ESTALE;
+	}
+
+	/* The first block carrying 'last', as xlog_find_cycle_start() finds it */
+	while (hi - lo > 1) {
+		uint64_t mid = lo + (hi - lo) / 2;
+
+		err = log_bb_cycle(xal, log_ofz, mid, &mid_cycle);
+		if (err) {
+			return err;
+		}
+		if (mid_cycle == last) {
+			hi = mid;
+		} else {
+			lo = mid;
+		}
+	}
+	*head = hi;
+
+	return 0;
+}
+
+/* Blocks back from the head to look for the header of the last record: a record of the largest
+ * log buffer, 256 KiB, and its header blocks */
+#define LOG_SCAN_NBBS (256 * 1024 / XAL_ODF_LOG_BBSIZE + 8)
+
+/**
+ * Find the header of the last record before the head of a log of 'nbbs' blocks, the nearest block
+ * that starts with the magic; the other blocks of a record start with their cycle. The log is read
+ * backwards from the head in reads of up to BUF_NBYTES, or the MDTS when smaller.
+ */
+static int
+log_last_record(struct xal *xal, uint64_t log_ofz, uint64_t nbbs, uint64_t head, uint64_t *rblk,
+		uint8_t *header)
+{
+	struct xal_be_xfs *be = (struct xal_be_xfs *)&xal->be;
+	const struct xnvme_geo *geo = xnvme_dev_get_geo(xal->dev);
+	uint64_t max_nbytes = BUF_NBYTES < geo->mdts_nbytes ? BUF_NBYTES : geo->mdts_nbytes;
+	uint64_t lba_nbbs = geo->lba_nbytes / XAL_ODF_LOG_BBSIZE;
+	uint64_t chunk_nbbs = max_nbytes / geo->lba_nbytes * lba_nbbs;
+	uint64_t pos = head, scanned = 0;
+	int err;
+
+	if (!lba_nbbs || !chunk_nbbs || nbbs % lba_nbbs) {
+		return -EOPNOTSUPP;
+	}
+	while (scanned < LOG_SCAN_NBBS && scanned < nbbs) {
+		uint64_t start, stop;
+
+		if (!pos) {
+			pos = nbbs;
+		}
+		stop = (pos + lba_nbbs - 1) / lba_nbbs * lba_nbbs;
+		start = stop > chunk_nbbs ? stop - chunk_nbbs : 0;
+
+		err = dev_read(xal->dev, be->buf, (stop - start) * XAL_ODF_LOG_BBSIZE,
+			       log_ofz + start * XAL_ODF_LOG_BBSIZE);
+		if (err) {
+			XAL_DEBUG("FAILED: dev_read(); err(%d)", err);
+			return err;
+		}
+		for (; pos > start && scanned < LOG_SCAN_NBBS; --pos, ++scanned) {
+			const uint8_t *block =
+			    (uint8_t *)be->buf + (pos - 1 - start) * XAL_ODF_LOG_BBSIZE;
+
+			if (log_bb_be32(block, 0) == XAL_ODF_LOG_HEADER_MAGIC) {
+				*rblk = pos - 1;
+				memcpy(header, block, XAL_ODF_LOG_BBSIZE);
+				return 0;
+			}
+		}
+	}
+
+	XAL_DEBUG("FAILED: no record header before the head(%" PRIu64 ")", head);
+
+	return -ESTALE;
+}
+
+/**
+ * Take from the internal log what tells its state apart: the LSN and CRC of the record at its
+ * head, which must be the unmount record a clean unmount by the kernel leaves there
+ *
+ * The CRC covers the record's data, and with it the tid of its operation, which the kernel draws
+ * at random; that is what tells two unmounts at the same LSN apart. A record that xfsprogs wrote,
+ * when it formatted the log (mkfs, xfs_repair -L), has neither.
+ *
+ * @return On success, 0 is returned. -EUCLEAN is returned when the last record is not an unmount
+ * record, as after a crash; -ENODATA when xfsprogs wrote it; -ESTALE when the log is not as a clean
+ * unmount leaves it in another way; -EOPNOTSUPP for an external log; other negative errno on
+ * error.
+ */
+static int
+log_key(struct xal *xal, const struct xal_odf_sb *sb, struct index_key *key)
+{
+	uint64_t logstart = be64toh(sb->logstart);
+	uint64_t nbbs = (uint64_t)be32toh(sb->logblocks) * xal->sb.blocksize / XAL_ODF_LOG_BBSIZE;
+	uint8_t header[XAL_ODF_LOG_BBSIZE], data[XAL_ODF_LOG_BBSIZE];
+	uint64_t log_ofz, head, rblk, hblks, end;
+	uint32_t cycle, rcycle, version, h_size;
+	int err;
+
+	if (!logstart) {
+		XAL_DEBUG("FAILED: external log");
+		return -EOPNOTSUPP;
+	}
+	if (nbbs < 2) {
+		return -ESTALE;
+	}
+	log_ofz = xal_fsbno_offset(xal, logstart);
+
+	err = log_find_head(xal, log_ofz, nbbs, &head, &cycle);
+	if (!err) {
+		err = log_last_record(xal, log_ofz, nbbs, head, &rblk, header);
+	}
+	if (err) {
+		return err;
+	}
+
+	version = log_bb_be32(header, XAL_ODF_LOG_H_VERSION);
+	h_size = log_bb_be32(header, XAL_ODF_LOG_H_SIZE);
+	hblks = 1;
+	if ((version & XAL_ODF_LOG_VERSION_2) && h_size > XAL_ODF_LOG_HEADER_CYCLE_SIZE) {
+		hblks =
+		    (h_size + XAL_ODF_LOG_HEADER_CYCLE_SIZE - 1) / XAL_ODF_LOG_HEADER_CYCLE_SIZE;
+	}
+	end = (rblk + hblks +
+	       (log_bb_be32(header, XAL_ODF_LOG_H_LEN) + XAL_ODF_LOG_BBSIZE - 1) /
+		   XAL_ODF_LOG_BBSIZE) %
+	      nbbs;
+	/* A record that starts at or past the head wrapped around the end of the log, and was
+	 * written in the cycle before the one block 0 carries */
+	rcycle = head && rblk >= head ? cycle - 1 : cycle;
+
+	memcpy(&key->log_lsn, header + XAL_ODF_LOG_H_LSN, sizeof(key->log_lsn));
+	key->log_lsn = be64toh(key->log_lsn);
+	memcpy(&key->log_crc, header + XAL_ODF_LOG_H_CRC, sizeof(key->log_crc));
+
+	if (end != head || log_bb_be32(header, XAL_ODF_LOG_H_CYCLE) != rcycle ||
+	    key->log_lsn != (((uint64_t)rcycle << 32) | rblk) ||
+	    memcmp(header + XAL_ODF_LOG_H_FS_UUID, &sb->sb_uuid, sizeof(key->uuid))) {
+		XAL_DEBUG("FAILED: the record at blk(%" PRIu64 ") does not end at head(%" PRIu64
+			  ")",
+			  rblk, head);
+		return -ESTALE;
+	}
+
+	/* A clean unmount leaves one operation, flagged as an unmount, as xlog_check_unmount_rec()
+	 * looks for it */
+	if (log_bb_be32(header, XAL_ODF_LOG_H_NUM_LOGOPS) != 1) {
+		XAL_DEBUG("FAILED: the log is dirty");
+		return -EUCLEAN;
+	}
+	err = log_bb_read(xal, log_ofz, (rblk + hblks) % nbbs, data);
+	if (err) {
+		return err;
+	}
+	if (!(data[XAL_ODF_LOG_OH_FLAGS] & XAL_ODF_LOG_UNMOUNT_TRANS)) {
+		XAL_DEBUG("FAILED: the log is dirty");
+		return -EUCLEAN;
+	}
+
+	/* The tid, the first word of the record's data, is kept in h_cycle_data[0] */
+	if (!key->log_crc || log_bb_be32(header, XAL_ODF_LOG_H_CYCLE_DATA) == LOG_XFSPROGS_TID) {
+		XAL_DEBUG("FAILED: the unmount record is from xfsprogs");
+		return -ENODATA;
+	}
+
+	return 0;
+}
+
+/* Keep the header sectors of the AG read for 'item' at its index in 'arg'; a batch_item_fn */
+static int
+ag_headers_store(struct xal *xal, const struct batch_item *item, const uint8_t *data, void *arg)
+{
+	memcpy((uint8_t *)arg + (size_t)item->idx * 4 * xal->sb.sectsize, data,
+	       4 * xal->sb.sectsize);
+
+	return 0;
+}
+
+/**
+ * Read the key of the filesystem's current state: its UUID, the unmount record at the head of its
+ * log, and the hash of the AG headers that xal_be_xfs_open() also takes
+ */
+static int
+index_key_get(struct xal *xal, struct index_key *key)
+{
+	const struct xnvme_geo *geo = xnvme_dev_get_geo(xal->dev);
+	size_t sect_nbytes = 4 * (size_t)xal->sb.sectsize;
+	struct xal_odf_sb sb;
+	struct batch_item *items;
+	uint8_t *headers;
+	int err;
+
+	memset(key, 0, sizeof(*key));
+
+	if (sect_nbytes % geo->lba_nbytes) {
+		return -EOPNOTSUPP;
+	}
+	items = calloc(xal->sb.agcount, sizeof(*items));
+	headers = malloc(xal->sb.agcount * sect_nbytes);
+	if (!items || !headers) {
+		XAL_DEBUG("FAILED: calloc()");
+		err = -ENOMEM;
+		goto exit;
+	}
+	for (uint32_t seqno = 0; seqno < xal->sb.agcount; ++seqno) {
+		items[seqno] = (struct batch_item){
+		    .ofz = xal_agbno_absolute_offset(xal, seqno, 0),
+		    .nbytes = sect_nbytes,
+		    .idx = seqno,
+		};
+	}
+	err = batch_read(xal, items, xal->sb.agcount, ag_headers_store, headers);
+	if (err) {
+		XAL_DEBUG("FAILED: batch_read(AG headers); err(%d)", err);
+		goto exit;
+	}
+
+	memcpy(&sb, headers, sizeof(sb));
+	/* The key rests on what v5 does: lazy counters written at each unmount, sb_lsn */
+	if ((be16toh(sb.versionnum) & XAL_ODF_SB_VERSION_NUMBITS) != XAL_ODF_SB_VERSION_5) {
+		XAL_DEBUG("FAILED: not a v5 filesystem");
+		err = -EOPNOTSUPP;
+		goto exit;
+	}
+	memcpy(key->uuid, &sb.sb_uuid, sizeof(key->uuid));
+	key->headers = fnv1a(FNV1A_BASIS, headers, xal->sb.agcount * sect_nbytes);
+
+	err = log_key(xal, &sb, key);
+
+exit:
+	free(items);
+	free(headers);
+
+	return err;
+}
+
+static int
+write_all(int fd, const void *buf, size_t nbytes)
+{
+	for (const uint8_t *cursor = buf; nbytes;) {
+		ssize_t ret = write(fd, cursor, nbytes);
+
+		if (ret < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			return -errno;
+		}
+		cursor += ret;
+		nbytes -= ret;
+	}
+
+	return 0;
+}
+
+static int
+read_all(int fd, void *buf, size_t nbytes)
+{
+	for (uint8_t *cursor = buf; nbytes;) {
+		ssize_t ret = read(fd, cursor, nbytes);
+
+		if (ret < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			return -errno;
+		}
+		if (!ret) {
+			return -EPROTO;
+		}
+		cursor += ret;
+		nbytes -= ret;
+	}
+
+	return 0;
+}
+
+/* Write 'hdr' and the pools to a new file next to 'path', sync it, and rename it over 'path' */
+static int
+index_file_write(struct xal *xal, const char *path, const struct index_file_hdr *hdr)
+{
+	char tmp[PATH_MAX], dir[PATH_MAX];
+	const char *slash;
+	int fd, err;
+
+	if ((size_t)snprintf(tmp, sizeof(tmp), "%s.XXXXXX", path) >= sizeof(tmp)) {
+		return -ENAMETOOLONG;
+	}
+	slash = strrchr(path, '/');
+	snprintf(dir, sizeof(dir), "%.*s", slash ? (int)(slash - path) + 1 : 1, slash ? path : ".");
+
+	/* Mode 0600: the index names every file on the filesystem, whatever its permissions */
+	fd = mkostemp(tmp, O_CLOEXEC);
+	if (fd < 0) {
+		XAL_DEBUG("FAILED: mkostemp(%s); errno(%d)", tmp, errno);
+		return -errno;
+	}
+	err = write_all(fd, hdr, sizeof(*hdr));
+	if (!err) {
+		err = write_all(fd, xal->inodes.memory, hdr->ninodes * hdr->inode_nbytes);
+	}
+	if (!err) {
+		err = write_all(fd, xal->extents.memory, hdr->nextents * hdr->extent_nbytes);
+	}
+	if (!err && fsync(fd)) {
+		err = -errno;
+	}
+	if (close(fd) && !err) {
+		err = -errno;
+	}
+	if (!err && rename(tmp, path)) {
+		err = -errno;
+	}
+	if (err) {
+		XAL_DEBUG("FAILED: writing(%s); err(%d)", path, err);
+		unlink(tmp);
+		return err;
+	}
+
+	fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (fd < 0) {
+		return -errno;
+	}
+	if (fsync(fd)) {
+		err = -errno;
+	}
+	close(fd);
+
+	return err;
+}
+
+int
+xal_index_save(struct xal *xal, const char *path)
+{
+	struct xal_be_xfs *be;
+	struct index_file_hdr hdr = {0};
+	int err;
+
+	if (!xal || !path) {
+		return -EINVAL;
+	}
+	be = (struct xal_be_xfs *)&xal->be;
+	if (be->base.type != XAL_BACKEND_XFS || xal->procrole == XAL_PROCROLE_SECONDARY) {
+		return -EINVAL;
+	}
+	if (atomic_exchange(&xal->indexing, true)) {
+		return -EBUSY;
+	}
+	if (xal->root_idx == XAL_POOL_IDX_NONE || xal_is_dirty(xal)) {
+		XAL_DEBUG("FAILED: no index to save");
+		err = -EINVAL;
+		goto exit;
+	}
+
+	err = index_key_get(xal, &hdr.key);
+	if (err) {
+		XAL_DEBUG("FAILED: index_key_get(); err(%d)", err);
+		goto exit;
+	}
+	/* The superblock is written when a mount of the filesystem is unmounted */
+	if (hdr.key.headers != be->tree->headers) {
+		XAL_DEBUG("FAILED: the filesystem changed since its inodes were read");
+		err = -ESTALE;
+		goto exit;
+	}
+
+	memcpy(hdr.magic, INDEX_FILE_MAGIC, sizeof(hdr.magic));
+	hdr.version = INDEX_FILE_VERSION;
+	hdr.shm_version = XAL_SHM_VERSION;
+	hdr.hdr_nbytes = sizeof(hdr);
+	hdr.inode_nbytes = sizeof(struct xal_inode);
+	hdr.extent_nbytes = sizeof(struct xal_extent);
+	hdr.ninodes = xal->inodes.free;
+	hdr.nextents = xal->extents.free;
+	hdr.root_idx = xal->root_idx;
+	hdr.root_ino = be->tree->root_ino;
+	hdr.sum =
+	    pools_sum(pools_sum(FNV1A_BASIS, xal->inodes.memory, hdr.ninodes * hdr.inode_nbytes),
+		      xal->extents.memory, hdr.nextents * hdr.extent_nbytes);
+	if (be->tree->subtree) {
+		strncpy(hdr.subtree, be->tree->subtree, XAL_PATH_MAXLEN);
+	}
+
+	err = index_file_write(xal, path, &hdr);
+
+exit:
+	atomic_store(&xal->indexing, false);
+
+	return err;
+}
+
+/**
+ * Whether the pools read by xal_index_load() form an index: every name terminated, every inode
+ * a directory or a regular file, every entry of a directory after it and pointing back at it, and
+ * every range inside the pools; the walks then end
+ */
+static bool
+index_in_range(struct xal *xal, const struct index_file_hdr *hdr)
+{
+	/* xal_index() claims the root first, and a secondary takes it to be there */
+	if (hdr->root_idx != 0 || hdr->root_idx >= hdr->ninodes ||
+	    xal_inode_at(xal, hdr->root_idx)->parent_idx != XAL_POOL_IDX_NONE) {
+		return false;
+	}
+	for (uint64_t i = 0; i < hdr->ninodes; ++i) {
+		struct xal_inode *inode = xal_inode_at(xal, i);
+
+		if (strnlen(inode->name, sizeof(inode->name)) != inode->namelen) {
+			return false;
+		}
+		if (i != hdr->root_idx && inode->parent_idx >= i) {
+			return false;
+		}
+		if (xal_inode_is_dir(inode)) {
+			uint64_t first = inode->content.dentries.inodes_idx;
+			uint64_t count = inode->content.dentries.count;
+
+			if (count && (first <= i || first + count > hdr->ninodes)) {
+				return false;
+			}
+			for (uint64_t k = first; k < first + count; ++k) {
+				if (xal_inode_at(xal, k)->parent_idx != i) {
+					return false;
+				}
+			}
+		} else if (xal_inode_is_file(inode)) {
+			if ((uint64_t)inode->content.extents.extent_idx +
+				inode->content.extents.count >
+			    hdr->nextents) {
+				return false;
+			}
+		} else {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+/* Read the index file at 'path' into the pools; see xal_index_load() */
+static int
+index_load(struct xal *xal, const char *path)
+{
+	struct xal_be_xfs *be = (struct xal_be_xfs *)&xal->be;
+	struct index_file_hdr hdr;
+	struct index_key key;
+	struct stat st;
+	uint32_t idx;
+	int fd, err;
+
+	fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0) {
+		XAL_DEBUG("FAILED: open(%s); errno(%d)", path, errno);
+		return -errno;
+	}
+	if (fstat(fd, &st)) {
+		err = -errno;
+		goto exit;
+	}
+	/* What the file says is what fil reads for each path */
+	if (!S_ISREG(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & (S_IWGRP | S_IWOTH))) {
+		XAL_DEBUG("FAILED: %s is not a file only this user can write", path);
+		err = -EPERM;
+		goto exit;
+	}
+	err = read_all(fd, &hdr, sizeof(hdr));
+	if (err) {
+		goto exit;
+	}
+	if (memcmp(hdr.magic, INDEX_FILE_MAGIC, sizeof(hdr.magic)) ||
+	    hdr.version != INDEX_FILE_VERSION || hdr.shm_version != XAL_SHM_VERSION ||
+	    hdr.hdr_nbytes != sizeof(hdr) || hdr.inode_nbytes != sizeof(struct xal_inode) ||
+	    hdr.extent_nbytes != sizeof(struct xal_extent) || hdr.ninodes > UINT32_MAX ||
+	    hdr.nextents > UINT32_MAX ||
+	    (uint64_t)st.st_size !=
+		sizeof(hdr) + hdr.ninodes * hdr.inode_nbytes + hdr.nextents * hdr.extent_nbytes) {
+		XAL_DEBUG("FAILED: %s is not an index this build reads", path);
+		err = -EPROTO;
+		goto exit;
+	}
+	hdr.subtree[XAL_PATH_MAXLEN] = '\0';
+	if (strcmp(hdr.subtree, be->tree->subtree ? be->tree->subtree : "")) {
+		XAL_DEBUG("FAILED: %s is of subtree(%s)", path, hdr.subtree);
+		err = -ESTALE;
+		goto exit;
+	}
+
+	err = index_key_get(xal, &key);
+	if (err) {
+		XAL_DEBUG("FAILED: index_key_get(); err(%d)", err);
+		goto exit;
+	}
+	if (memcmp(&key, &hdr.key, sizeof(key))) {
+		XAL_DEBUG("INFO: the filesystem changed since %s was saved", path);
+		err = -ESTALE;
+		goto exit;
+	}
+	/* The AGs the handle keeps (inobt roots, counts) are those xal_open() read */
+	if (key.headers != be->tree->headers) {
+		XAL_DEBUG("FAILED: the filesystem changed since it was opened");
+		err = -ESTALE;
+		goto exit;
+	}
+
+	atomic_store(xal->index_state, XAL_STATE_INDEXING);
+	atomic_fetch_add(xal->seq_lock, 1);
+
+	xal->root_idx = XAL_POOL_IDX_NONE;
+	xal_pool_clear(&xal->inodes);
+	xal_pool_clear(&xal->extents);
+
+	if (hdr.ninodes) {
+		err = xal_pool_claim_inodes(&xal->inodes, hdr.ninodes, &idx);
+	}
+	if (!err) {
+		err = read_all(fd, xal->inodes.memory, hdr.ninodes * hdr.inode_nbytes);
+	}
+	if (!err && hdr.nextents) {
+		err = xal_pool_claim_extents(&xal->extents, hdr.nextents, &idx);
+	}
+	if (!err) {
+		err = read_all(fd, xal->extents.memory, hdr.nextents * hdr.extent_nbytes);
+	}
+	if (!err &&
+	    (pools_sum(pools_sum(FNV1A_BASIS, xal->inodes.memory, hdr.ninodes * hdr.inode_nbytes),
+		       xal->extents.memory, hdr.nextents * hdr.extent_nbytes) != hdr.sum ||
+	     !index_in_range(xal, &hdr))) {
+		XAL_DEBUG("FAILED: %s is damaged", path);
+		err = -EPROTO;
+	}
+	if (!err) {
+		xal->root_idx = hdr.root_idx;
+		be->tree->root_ino = hdr.root_ino;
+
+		/* The inodes are not those of this index; xal_index() needs them read again */
+		dirblocks_free(xal);
+		if (be->dinodes_map) {
+			kh_destroy(ino_to_dinode, be->dinodes_map);
+			be->dinodes_map = NULL;
+		}
+		free(be->dinodes);
+		be->dinodes = NULL;
+	} else {
+		xal_pool_clear(&xal->inodes);
+		xal_pool_clear(&xal->extents);
+	}
+
+	atomic_fetch_add(xal->seq_lock, 1);
+	xal_mark_index_done(xal, err);
+	atomic_store(&xal->last_index_err, err);
+
+exit:
+	close(fd);
+
+	return err;
+}
+
+int
+xal_index_load(struct xal *xal, const char *path)
+{
+	struct xal_be_xfs *be;
+	int err;
+
+	if (!xal || !path) {
+		return -EINVAL;
+	}
+	be = (struct xal_be_xfs *)&xal->be;
+	if (be->base.type != XAL_BACKEND_XFS || xal->procrole == XAL_PROCROLE_SECONDARY) {
+		return -EINVAL;
+	}
+	if (atomic_exchange(&xal->indexing, true)) {
+		return -EBUSY;
+	}
+
+	err = index_load(xal, path);
+
+	atomic_store(&xal->indexing, false);
 
 	return err;
 }
