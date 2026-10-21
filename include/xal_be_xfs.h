@@ -32,7 +32,7 @@ struct xal_be_xfs {
 	struct xal_backend_base base;
 	void *buf;            ///< A single buffer for repetitive IO
 	uint8_t *dinodes;     ///< Array of inodes in on-disk-format
-	void *dinodes_map;    ///< Map of dinodes for O(1) ~ avg. lookup
+	void *dinodes_map;    ///< How an inode is found in dinodes; see struct dinodes_index
 	struct xal_ag *ags;   ///< Array of 'agcount' number of allocation-groups
 	void *dirblocks;      ///< Directory blocks read ahead for xal_index(); NULL outside it
 	struct xal_be_xfs_tree *tree; ///< Set up by xal_be_xfs_open() and xal_from_shm()
