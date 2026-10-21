@@ -25,6 +25,7 @@ struct xal_cli_args {
 	char *backend;
 	char *dev_uri;
 	char *filename;
+	char *subtree;
 };
 
 struct xal_nodeinspector_args {
@@ -64,6 +65,13 @@ parse_args(int argc, char *argv[], struct xal_cli_args *args)
 				return -EINVAL;
 			}
 			args->filename = argv[++i];
+		} else if (strcmp(argv[i], "--subtree") == 0) {
+			if (i + 1 >= argc) {
+				fprintf(stderr, "Error: Subtree argument must define a path: "
+						"--subtree <path>\n");
+				return -EINVAL;
+			}
+			args->subtree = argv[++i];
 		} else if (args->dev_uri == NULL) {
 			args->dev_uri = argv[i];
 		} else {
@@ -207,6 +215,8 @@ main(int argc, char *argv[])
 	if (args.file_lookup_map) {
 		opts.file_lookupmode = XAL_FILE_LOOKUPMODE_HASHMAP;
 	}
+
+	opts.subtree = args.subtree;
 
 	err = xal_open(dev, &xal, &opts);
 	if (err < 0) {
