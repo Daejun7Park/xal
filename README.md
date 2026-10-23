@@ -110,15 +110,27 @@ is only loaded if the dependencies are present.
   file open for writing gets no lease, and `xal_extents_acquire()` returns
   `-EAGAIN` for it.
 
+A caller that opens its files and registers them before reading can hand the
+descriptor to `xal_extents_attach_fd()`, which takes the lease on it and maps
+the file then, so the first `xal_extents_acquire()` makes no system call
+either. The caller keeps the descriptor open until `xal_extents_detach_fd()`,
+`xal_index()` or `xal_close()`; xal never closes it. On a descriptor open for
+writing the lease is a write lease: it needs the file to be open nowhere else,
+and any other `open()` or `truncate()` of the file then waits for the readers.
+Writes through that descriptor do not wait; the next `xal_extents_release()`
+finds them by the file's size and ctime and returns `-ESTALE`, and the next
+acquire maps the file again.
+
 Where `XAL_WATCHMODE_REFLINK_SNAPSHOT` lets writers go ahead and keeps the
 old data for readers, this mode makes writers wait for readers, and writes
 nothing to the filesystem itself. It needs:
 
 * the files to be owned by the caller, or `CAP_LEASE`
-* one file descriptor per file under a lease. Past `xal_opts.lease_max`, by
-  default half the soft `RLIMIT_NOFILE`, or when out of descriptors, xal
-  drops the lease of a file without readers that was not acquired since the
-  last pass, and maps it again on its next `xal_extents_acquire()`
+* one file descriptor per file under a lease, except attached files, which
+  use the caller's. Past `xal_opts.lease_max`, by default half the soft
+  `RLIMIT_NOFILE`, or when out of descriptors, xal drops the lease of a file
+  without readers that was not acquired since the last pass, and maps it
+  again on its next `xal_extents_acquire()`
 * readers to release within `/proc/sys/fs/lease-break-time` seconds, after
   which the kernel lets a waiting writer through anyway; a later
   `xal_extents_release()` returns `-ESTALE` once xal's thread has taken the
