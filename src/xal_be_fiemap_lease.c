@@ -575,10 +575,11 @@ lease_proc_unregister(struct xal_lease_set *ls)
  * could not serve fails the mapping.
  */
 static int
-map_fiemap(int fd, uint64_t size, uint32_t blocksize, uint32_t fm_flags, struct ext_vec *vec)
+map_fiemap(int fd, uint64_t from, uint64_t to, uint64_t size, uint32_t blocksize, uint32_t fm_flags,
+	   struct ext_vec *vec)
 {
 	struct fiemap *fm;
-	uint64_t start = 0;
+	uint64_t start = from;
 	int err = 0;
 
 	/* The kernel reads only the header, and every release with recheck calls this */
@@ -588,11 +589,11 @@ map_fiemap(int fd, uint64_t size, uint32_t blocksize, uint32_t fm_flags, struct 
 	}
 	memset(fm, 0, sizeof(*fm));
 
-	while (start < size) {
+	while (start < to) {
 		struct fiemap_extent *last;
 
 		fm->fm_start = start;
-		fm->fm_length = size - start;
+		fm->fm_length = to - start;
 		fm->fm_flags = fm_flags;
 		fm->fm_extent_count = XAL_FIEMAP_BATCH;
 		fm->fm_mapped_extents = 0;
@@ -716,7 +717,8 @@ lease_and_map(struct xal_lease_set *ls, struct xal_inode *inode, uint32_t idx)
 		goto failed_unlock;
 	}
 
-	err = map_fiemap(fd, st.st_size, ls->xal->sb.blocksize, FIEMAP_FLAG_SYNC, &vec);
+	err = map_fiemap(fd, 0, st.st_size, st.st_size, ls->xal->sb.blocksize, FIEMAP_FLAG_SYNC,
+			 &vec);
 	if (err) {
 		goto failed_unlock;
 	}
@@ -878,13 +880,98 @@ lease_held(struct xal_lease_set *ls, int fd)
 }
 
 /*
+ * Appends the parts of v[0..n) within blocks [lo, hi), joined as ext_vec_push() joins them. v is
+ * sorted by start_offset, so the first extent ending past lo is found by bisection.
+ */
+static int
+ext_vec_clip(struct ext_vec *out, const struct xal_extent *v, uint32_t n, uint64_t lo, uint64_t hi,
+	     uint32_t blocksize)
+{
+	uint32_t left = 0, right = n;
+
+	while (left < right) {
+		uint32_t mid = left + (right - left) / 2;
+
+		if (v[mid].start_offset + v[mid].nblocks <= lo) {
+			left = mid + 1;
+		} else {
+			right = mid;
+		}
+	}
+	for (uint32_t i = left; i < n && v[i].start_offset < hi; ++i) {
+		uint64_t a = v[i].start_offset > lo ? v[i].start_offset : lo;
+		uint64_t b = v[i].start_offset + v[i].nblocks;
+		struct fiemap_extent fe = {0};
+		int err;
+
+		b = b < hi ? b : hi;
+		fe.fe_logical = a * blocksize;
+		fe.fe_physical = (v[i].start_block + (a - v[i].start_offset)) * blocksize;
+		fe.fe_length = (b - a) * blocksize;
+		err = ext_vec_push(out, &fe, blocksize);
+		if (err) {
+			return err;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * lease_check() for the blocks holding [offset, offset + length): a FIEMAP of those blocks, and
+ * both mappings cut to them, since an extent may reach past the range on either side
+ */
+static int
+lease_check_range(struct xal_lease_set *ls, struct xal_inode *inode, struct xal_lease_entry *e,
+		  uint64_t offset, uint64_t length)
+{
+	struct xal_extents *extents = &inode->content.extents;
+	struct ext_vec now = {0}, held = {0}, cur = {0};
+	uint32_t bs = ls->xal->sb.blocksize;
+	uint64_t end, lo, hi;
+	int err;
+
+	if (offset >= inode->size || !length) {
+		return 0;
+	}
+	end = length < inode->size - offset ? offset + length : inode->size;
+	lo = offset / bs;
+	hi = (end + bs - 1) / bs;
+
+	err = map_fiemap(e->fd, lo * bs, hi * bs, inode->size, bs, 0, &now);
+	if (!err && extents->count) {
+		err = ext_vec_clip(&held, xal_extent_at(ls->xal, extents->extent_idx),
+				   extents->count, lo, hi, bs);
+	}
+	if (!err) {
+		err = ext_vec_clip(&cur, now.v, now.n, lo, hi, bs);
+	}
+	if (!err && held.n != cur.n) {
+		err = -ESTALE;
+	}
+	for (uint32_t i = 0; i < cur.n && !err; ++i) {
+		if (held.v[i].start_offset != cur.v[i].start_offset ||
+		    held.v[i].start_block != cur.v[i].start_block ||
+		    held.v[i].nblocks != cur.v[i].nblocks) {
+			err = -ESTALE;
+		}
+	}
+	free(now.v);
+	free(held.v);
+	free(cur.v);
+
+	return err;
+}
+
+/*
  * Whether the extents handed to a reader may no longer hold the file's data: a release already
  * found so, or the kernel has let a writer past the broken lease, or, with recheck, the file no
  * longer maps as it did, as after a dedupe into it or the filesystem moving its data, which break
  * no lease. Called by a reader, which keeps e->fd open and the extents in place.
  */
 static int
-lease_check(struct xal_lease_set *ls, struct xal_inode *inode, struct xal_lease_entry *e)
+lease_check(struct xal_lease_set *ls, struct xal_inode *inode, struct xal_lease_entry *e,
+	    uint64_t offset, uint64_t length)
 {
 	struct xal_extents *extents = &inode->content.extents;
 	struct ext_vec vec = {0};
@@ -904,8 +991,12 @@ lease_check(struct xal_lease_set *ls, struct xal_inode *inode, struct xal_lease_
 	if (!ls->recheck) {
 		return 0;
 	}
+	if (offset || length < inode->size) {
+		err = lease_check_range(ls, inode, e, offset, length);
+		return err == -EOPNOTSUPP ? -ESTALE : err;
+	}
 
-	err = map_fiemap(e->fd, inode->size, ls->xal->sb.blocksize, 0, &vec);
+	err = map_fiemap(e->fd, 0, inode->size, inode->size, ls->xal->sb.blocksize, 0, &vec);
 	if (!err && vec.n != extents->count) {
 		err = -ESTALE;
 	}
@@ -991,8 +1082,8 @@ xal_extents_acquire(struct xal *xal, struct xal_inode *inode, struct xal_extents
 	}
 }
 
-int
-xal_extents_release(struct xal *xal, struct xal_inode *inode)
+static int
+extents_release(struct xal *xal, struct xal_inode *inode, uint64_t offset, uint64_t length)
 {
 	struct xal_lease_set *ls;
 	uint32_t idx;
@@ -1019,7 +1110,7 @@ xal_extents_release(struct xal *xal, struct xal_inode *inode)
 		return -EINVAL;
 	}
 
-	err = lease_check(ls, inode, &ls->entries[idx]);
+	err = lease_check(ls, inode, &ls->entries[idx], offset, length);
 	if (err) {
 		pthread_mutex_lock(&ls->lock);
 		if (err == -ESTALE) {
@@ -1034,6 +1125,19 @@ xal_extents_release(struct xal *xal, struct xal_inode *inode)
 	put = lease_reader_put(ls, idx);
 
 	return put ? put : err;
+}
+
+int
+xal_extents_release(struct xal *xal, struct xal_inode *inode)
+{
+	return extents_release(xal, inode, 0, UINT64_MAX);
+}
+
+int
+xal_extents_release_range(struct xal *xal, struct xal_inode *inode, uint64_t offset,
+			  uint64_t length)
+{
+	return extents_release(xal, inode, offset, length);
 }
 
 int

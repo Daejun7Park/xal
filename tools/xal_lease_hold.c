@@ -7,18 +7,19 @@
  * test check that a writer of <file> waits while the extents are held and that the extents still
  * hold the file's data meanwhile.
  *
- * Usage: xal_lease_hold [--no-recheck] [--max <n>] [--exhaust]
+ * Usage: xal_lease_hold [--no-recheck] [--max <n>] [--exhaust] [--range <offset>:<length>]
  *                       [--probe | --shm | --thread | --fork | --orphan | --poll | --twice |
  *                        --idle <file2> | --sweep] <dev_uri> <mountpoint> <file>
  *
- * --no-recheck sets xal_opts.lease_no_recheck and --max xal_opts.lease_max. --exhaust opens
+ * --no-recheck sets xal_opts.lease_no_recheck and --max xal_opts.lease_max. --range makes the
+ * release after SIGUSR1 xal_extents_release_range() of those bytes. --exhaust opens
  * /dev/null until no descriptor is left, after the extents are held, and acquires no more. Without
  * a mode option, prints once the extents are held:
  *   LEASE_READY pid=<pid> byte=<device byte offset of the first extent> extents=<n>
  * then waits for SIGUSR1, releases the extents and prints RELEASED err=<what xal_extents_release()
  * returned>. It then acquires them again every 50 ms until that succeeds, which it can once the
- * writer has closed the file, and prints
- *   REACQUIRED byte=<device byte offset of the first extent> extents=<n>
+ * writer has closed the file, releases them, and prints
+ *   REACQUIRED byte=<device byte offset of the first extent> extents=<n> release=<err>
  * and waits for SIGTERM or SIGINT before closing.
  *
  * --poll, instead of waiting for SIGUSR1, calls xal_extents_recalled() every 10 ms and, once it
@@ -70,6 +71,8 @@
 static volatile sig_atomic_t g_release = 0;
 static bool g_exhaust;
 static volatile sig_atomic_t g_stop = 0;
+static bool g_range;
+static uint64_t g_range_off, g_range_len;
 
 static void
 on_signal(int signo)
@@ -401,7 +404,8 @@ hold(struct xal *xal, struct xal_inode *inode, struct xal_inode *idle, int mode,
 	while (mode != 'P' && !g_release && !g_stop) {
 		sigsuspend(orig);
 	}
-	err = xal_extents_release(xal, inode);
+	err = g_range ? xal_extents_release_range(xal, inode, g_range_off, g_range_len)
+		      : xal_extents_release(xal, inode);
 	printf("RELEASED err=%d\n", err);
 	fflush(stdout);
 
@@ -420,10 +424,12 @@ hold(struct xal *xal, struct xal_inode *inode, struct xal_inode *idle, int mode,
 	for (int i = 0; i < 600 && !g_stop && !g_exhaust; ++i) {
 		err = xal_extents_acquire(xal, inode, &extents);
 		if (!err) {
-			printf("REACQUIRED byte=%" PRIu64 " extents=%u\n", first_byte(xal, extents),
-			       extents->count);
+			uint64_t byte = first_byte(xal, extents);
+			uint32_t count = extents->count;
+
+			printf("REACQUIRED byte=%" PRIu64 " extents=%u release=%d\n", byte, count,
+			       xal_extents_release(xal, inode));
 			fflush(stdout);
-			xal_extents_release(xal, inode);
 			break;
 		}
 		nanosleep(&retry, NULL);
@@ -444,6 +450,7 @@ int
 main(int argc, char *argv[])
 {
 	static const struct option longopts[] = {
+	    /* Modes, at most one */
 	    {"probe", no_argument, NULL, 'p'},
 	    {"shm", no_argument, NULL, 's'},
 	    {"thread", no_argument, NULL, 't'},
@@ -453,9 +460,11 @@ main(int argc, char *argv[])
 	    {"twice", no_argument, NULL, '2'},
 	    {"idle", required_argument, NULL, 'i'},
 	    {"sweep", no_argument, NULL, 'w'},
+	    /* Modifiers */
 	    {"no-recheck", no_argument, NULL, 'r'},
 	    {"max", required_argument, NULL, 'm'},
 	    {"exhaust", no_argument, NULL, 'x'},
+	    {"range", required_argument, NULL, 'R'},
 	    {NULL, 0, NULL, 0},
 	};
 	struct xal_opts opts = {0};
@@ -479,6 +488,14 @@ main(int argc, char *argv[])
 			g_exhaust = true;
 			continue;
 		}
+		if (c == 'R') {
+			char *colon;
+
+			g_range = true;
+			g_range_off = strtoull(optarg, &colon, 0);
+			g_range_len = *colon == ':' ? strtoull(colon + 1, NULL, 0) : 0;
+			continue;
+		}
 		if (c == '?' || mode) {
 			mode = '?';
 			break;
@@ -491,6 +508,7 @@ main(int argc, char *argv[])
 	if (mode == '?' || argc - optind != 3) {
 		fprintf(stderr,
 			"Usage: %s [--no-recheck] [--max <n>] [--exhaust] "
+			"[--range <offset>:<length>] "
 			"[--probe | --shm | --thread | --fork | --orphan | --poll | "
 			"--twice | --idle <file2> | --sweep] "
 			"<dev_uri> <mountpoint> <file>\n",
