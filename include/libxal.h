@@ -704,28 +704,29 @@ xal_get_extents(struct xal *xal, char *path, struct xal_extents **extents);
 /**
  * Pin the extents of a regular file for raw reads
  *
- * With XAL_WATCHMODE_READ_LEASE, the first call for a file opens it read-only, takes a read lease
- * on it and maps it with FIEMAP_FLAG_SYNC, so dirty data is written back first. The extents then
- * cover the file's data up to its size: unwritten extents are left out, as they read as zeros like
- * holes, and extents past the end of the file are left out or cut at the block holding it. Each
- * call counts the caller as a reader
- * until xal_extents_release(). A writer's open() or truncate() of the file breaks the lease; the
- * writer waits until the last reader has released, xal then releases the lease, and the next call
- * maps the file again. Between the two calls the extents therefore hold the file's data, unless
- * xal_extents_release() returns an error. In other watch modes this returns the indexed extents
- * and pins nothing.
+ * With XAL_WATCHMODE_READ_LEASE, the first call for a file not attached with
+ * xal_extents_attach_fd() opens it read-only, takes a read lease on it and maps it with
+ * FIEMAP_FLAG_SYNC, so dirty data is written back first. The extents then cover the file's data up
+ * to its size: unwritten extents are left out, as they read as zeros like holes, and extents past
+ * the end of the file are left out or cut at the block holding it. Each call counts the caller as a
+ * reader until xal_extents_release(). A writer's open() or truncate() of the file breaks the lease;
+ * the writer waits until the last reader has released, xal then releases the lease, and the next
+ * call maps the file again. Between the two calls the extents therefore hold the file's data,
+ * unless xal_extents_release() returns an error. In other watch modes this returns the indexed
+ * extents and pins nothing.
  *
- * Every successful call must be paired with xal_extents_release() on the same inode. Neither may
- * run concurrently with xal_index() or xal_close() on the same handle, and xal_index() fails with
- * -EBUSY while extents are held.
+ * Every successful call must be paired with xal_extents_release() on the same inode. Neither, nor
+ * xal_extents_attach_fd() or xal_extents_detach_fd(), may run concurrently with xal_index() or
+ * xal_close() on the same handle, and xal_index() fails with -EBUSY while extents are held.
  *
  * Requirements and limits of XAL_WATCHMODE_READ_LEASE:
  *  - The caller owns the files or has CAP_LEASE, and /proc/sys/fs/leases-enable is 1.
- *  - Every mapped file holds a file descriptor while it has a lease. Past xal_opts.lease_max
- *    leases, or when xal runs out of descriptors, for a file or a release's check, it drops the
- *    lease of a file without readers that was not acquired since the last pass, and maps that
- *    file again on its next acquire. This returns -EMFILE only when every leased file has
- *    readers.
+ *  - Every mapped file holds a descriptor of xal's while it has a lease, unless it was attached
+ *    with xal_extents_attach_fd(). Past xal_opts.lease_max such leases, or when xal runs out of
+ *    descriptors, for a file or a release's check, it drops the lease of a file without readers
+ *    that was not acquired since the last pass, and maps that file again on its next acquire;
+ *    attached files are neither counted nor dropped. This returns -EMFILE only when every leased
+ *    file has readers.
  *  - The kernel lets a waiting writer through after /proc/sys/fs/lease-break-time seconds (45 by
  *    default) even if readers remain, so a reader must release within that time. A reader that
  *    releases later gets -ESTALE from xal_extents_release(), once xal's thread has taken the
@@ -740,34 +741,37 @@ xal_get_extents(struct xal *xal, char *path, struct xal_extents **extents);
  *    those signals when they are sent to the process, so the caller must not use SIGRTMIN+7 or
  *    rely on SIGIO sent to the process while a handle in this mode is open.
  *  - The leases belong to the process that opened the handle. In a forked child this returns
- *    -ECHILD, and xal_index() fails with -ECHILD. A child is told apart by pthread_atfork(), so
- *    one made without the fork handlers, as by clone() or _Fork(), is not. Such a child must not
- *    use or close the handle, as it would release the parent's leases. A forked child closes the
- *    leased files it inherits at fork(). fork() waits for xal's locks, which xal_open(),
- *    xal_close(), xal_index(), xal_extents_acquire(), xal_extents_release() and xal_lease_stats()
- *    hold for short spans, so do not call these while holding a lock that a fork handler of the
- *    caller takes, nor call fork() from a signal handler while a handle in this mode is open. A
- *    file being mapped at fork(), or whose lease another thread is dropping, stays open in the
- *    child, even after xal_close() there, until it exits or execs.
- *  - Only changes that open the file for writing or truncate it break the lease. Others are not
- *    prevented: a dedupe (FIDEDUPERANGE) through a read-only descriptor, which the file's owner,
- *    anyone with write permission on it, or CAP_SYS_ADMIN may do; data moved by the filesystem
- *    itself, as zoned XFS garbage collection does. The blocks read before may meanwhile have been
- *    given to another file. xal_extents_release() should find such changes and return -ESTALE
- *    (tested with a dedupe), unless xal_opts.lease_no_recheck is set. Writes to the block device
- *    itself are not seen at all.
+ *    -ECHILD, and xal_index() fails with -ECHILD. A child is told apart by pthread_atfork(), so one
+ *    made without the fork handlers, as by clone() or _Fork(), is not. Such a child must not use or
+ *    close the handle, as it would release the parent's leases. A forked child closes the leased
+ *    files of xal's it inherits at fork(). fork() waits for xal's locks, which xal_open(),
+ *    xal_close(), xal_index(), xal_extents_acquire(), xal_extents_release(),
+ *    xal_extents_release_range(), xal_extents_attach_fd(), xal_extents_detach_fd() and
+ *    xal_lease_stats() hold for short spans, so do not call these while holding a lock that a fork
+ *    handler of the caller takes, nor call fork() from a signal handler while a handle in this mode
+ *    is open. A file being mapped at fork(), or whose lease another thread is dropping, stays open
+ *    in the child, even after xal_close() there, until it exits or execs.
+ *  - Only changes that open the file for writing or truncate it break a read lease; any open breaks
+ *    a write lease, see xal_extents_attach_fd(). Others are not prevented: a dedupe (FIDEDUPERANGE)
+ *    through a read-only descriptor, which the file's owner, anyone with write permission on it, or
+ *    CAP_SYS_ADMIN may do; data moved by the filesystem itself, as zoned XFS garbage collection
+ *    does. The blocks read before may meanwhile have been given to another file.
+ *    xal_extents_release() should find such changes and return -ESTALE (tested with a dedupe),
+ *    unless xal_opts.lease_no_recheck is set. Writes to the block device itself are not seen at
+ *    all.
  *  - Not supported together with xal_opts.shm_name.
- *  - xal_get_extents() and xal_walk() report no extents for a file until it has been acquired,
- *    nor after its lease has been broken or dropped.
+ *  - xal_get_extents() and xal_walk() report no extents for a file until it has been acquired or
+ *    attached, nor after its lease has been broken or dropped.
  *
  * @param xal The xal struct obtained when opened with xal_open() or xal_open_from_uri()
  * @param inode A regular file in the index
  * @param extents Set to the file's extents on success
  *
- * @return On success, 0. -EAGAIN when the file is open for writing or its lease is being
- * recalled, -ESTALE when the indexed path now names another file, -EOPNOTSUPP when part of the
- * file is not stored as is on the device (delayed allocation, inline, encoded or encrypted data),
- * -ECHILD in a forked child, other negative errno on error.
+ * @return On success, 0. -EAGAIN when the lease cannot be taken (the file is open for writing, or,
+ * for a write lease, open elsewhere at all) or is being recalled, -ESTALE when the indexed path now
+ * names another file, -EOPNOTSUPP when part of the file is not stored as is on the device (delayed
+ * allocation, inline, encoded or encrypted data), -ECHILD in a forked child, other negative errno
+ * on error.
  */
 int
 xal_extents_acquire(struct xal *xal, struct xal_inode *inode, struct xal_extents **extents);
@@ -778,15 +782,17 @@ xal_extents_acquire(struct xal *xal, struct xal_inode *inode, struct xal_extents
  * Call it once every read or DMA through the extents has completed. With
  * XAL_WATCHMODE_READ_LEASE it returns -ESTALE when the kernel has let a writer past the file's
  * broken lease, as it does after lease-break-time, or when an earlier release found the extents
- * stale. Otherwise it maps the file again with FIEMAP and returns -ESTALE when the extents differ,
- * which finds changes that break no lease; this costs a FIEMAP per release, which grows with the
- * number of extents and, on XFS, takes the AGF buffer lock and a refcount btree lookup per extent
- * of a file that has ever shared blocks, so that releases of such files in one allocation group
- * wait for each other. xal_opts.lease_no_recheck leaves it out. After -ESTALE the file is mapped
- * again on a later xal_extents_acquire(). Not seen: a mapping that changed and changed back, writes
- * to the block device, and a break that xal's thread has not taken yet; when /proc/self/fdinfo
- * cannot be read, as without /proc, one taken more than 250 ms after the kernel issued it, with
- * lease-break-time as last read, 45 s if never. In other watch modes this does nothing.
+ * stale, or, for a write lease, when the file's size or ctime differ from when it was mapped,
+ * which finds writes through the descriptor holding it. Otherwise it maps the file again with
+ * FIEMAP and returns -ESTALE when the extents differ, which finds changes that break no lease;
+ * this costs a FIEMAP per release, which grows with the number of extents and, on XFS, takes the
+ * AGF buffer lock and a refcount btree lookup per extent of a file that has ever shared blocks, so
+ * that releases of such files in one allocation group wait for each other.
+ * xal_opts.lease_no_recheck leaves it out. After -ESTALE the file is mapped again on a later
+ * xal_extents_acquire(). Not seen: a mapping that changed and changed back, writes to the block
+ * device, and a break that xal's thread has not taken yet; when /proc/self/fdinfo cannot be read,
+ * as without /proc, one taken more than 250 ms after the kernel issued it, with lease-break-time as
+ * last read, 45 s if never. In other watch modes this does nothing.
  *
  * @param xal The xal struct obtained when opened with xal_open() or xal_open_from_uri()
  * @param inode The inode passed to xal_extents_acquire()
@@ -803,15 +809,70 @@ xal_extents_release(struct xal *xal, struct xal_inode *inode);
  * xal_extents_release() for a caller that read only [offset, offset + length) through the extents
  *
  * The check maps only the blocks holding that range again, one FIEMAP call per 256 extents in
- * them, and compares the extents within them; changes elsewhere in the file are not seen. With
- * length 0, or offset at or past the file's size, nothing is mapped. With
- * xal_opts.lease_no_recheck it is xal_extents_release().
+ * them, and compares the extents within them; changes elsewhere in the file are not seen, except
+ * that for a write lease a change of the file's size or ctime anywhere is. With length 0, or
+ * offset at or past the file's size, nothing is mapped. With xal_opts.lease_no_recheck it is
+ * xal_extents_release().
  *
  * @return As xal_extents_release().
  */
 int
 xal_extents_release_range(struct xal *xal, struct xal_inode *inode, uint64_t offset,
 			  uint64_t length);
+
+/**
+ * Hold a file's lease on the caller's descriptor of it, and map the file now
+ *
+ * XAL_WATCHMODE_READ_LEASE only. For a caller that opens its files and registers them before
+ * reading, as cuFile-like callers do: the open(), F_SETLEASE and first FIEMAP leave the first
+ * xal_extents_acquire(), which then, like later ones, makes no system call while the lease holds.
+ * xal takes a read lease when fd is open read-only and a write lease otherwise, takes over fd's
+ * F_SETSIG and owner for the break, takes the lease again on fd after a break, and never closes
+ * fd. xal_index() and xal_close() release every attachment and leave the descriptors open.
+ *  - fd must stay open, and name that file, until xal_extents_detach_fd(), xal_index() or
+ *    xal_close(): closing it drops the lease without xal noticing. Its open file must not hold a
+ *    lease of the caller's own, and may be attached once: not again through a dup(), nor for
+ *    another name of the file, nor in another handle. Open it with O_CLOEXEC; a child forked
+ *    without exec keeps the lease.
+ *  - A write lease is granted only while fd's open file is the file's only one. Any other open(),
+ *    a read-only or failed O_NONBLOCK one included, and truncate() break it, and while that open
+ *    file stays open xal_extents_acquire() returns -EAGAIN. A thread holding the extents must
+ *    therefore not open the file itself: the open waits for its own release, up to
+ *    lease-break-time.
+ *  - Writes, ftruncate(), fallocate(), clones and stores through a shared mapping of fd break
+ *    nothing; they change the file's ctime, and the next xal_extents_release() or
+ *    xal_extents_release_range(), whatever its range, returns -ESTALE when the size or ctime
+ *    differs from the mapping's, and the next acquire maps the file again with FIEMAP_FLAG_SYNC.
+ *    A change of the file's metadata, as chmod(), setxattr() or a new link, also changes the
+ *    ctime and gives -ESTALE although the data did not change. Not seen: writes through fd when it
+ *    was opened with XFS_IOC_OPEN_BY_HANDLE, which updates no ctime; without multigrain timestamps
+ *    (XFS before Linux 6.13), a write in the same clock tick as the mapping; and an O_DIRECT write
+ *    through fd still in flight while the file is mapped, which the recheck's FIEMAP finds unless
+ *    xal_opts.lease_no_recheck is set.
+ *
+ * @param xal The xal struct obtained when opened with xal_open() or xal_open_from_uri()
+ * @param inode A regular file in the index
+ * @param fd The caller's descriptor of that file
+ * @param attached Set to the inode to pass for the attached file afterwards, which is inode; may be
+ *        NULL
+ *
+ * @return On success, 0. -EAGAIN when the lease cannot be taken now, where a retry may succeed;
+ * -EBUSY when the file has readers, is being mapped, dropped or revoked, or is attached, or fd is
+ * attached already; -EINVAL when the handle is not in XAL_WATCHMODE_READ_LEASE or fd is not the
+ * file's; -ECHILD in a forked child; other negative errno as xal_extents_acquire().
+ */
+int
+xal_extents_attach_fd(struct xal *xal, struct xal_inode *inode, int fd,
+		      struct xal_inode **attached);
+
+/**
+ * Release the lease xal_extents_attach_fd() took, and leave fd open
+ *
+ * @return On success, 0. -EBUSY while the file has readers or is being mapped, dropped or revoked,
+ * -EINVAL when it is not attached, -ECHILD in a forked child.
+ */
+int
+xal_extents_detach_fd(struct xal *xal, struct xal_inode *inode);
 
 /**
  * Say whether the readers of a file's extents should release them
@@ -838,7 +899,7 @@ xal_extents_recalled(struct xal *xal, struct xal_inode *inode, uint64_t *left_ns
 
 struct xal_lease_stats {
 	uint64_t mapped;   ///< Files mapped under a lease, counting re-maps
-	uint64_t unsealed; ///< Lease attempts refused because the file was open for writing
+	uint64_t unsealed; ///< Lease attempts refused: open for writing, or for a write lease open
 	uint64_t breaks;   ///< Lease-break notifications received
 	uint64_t revoked;  ///< Leases released after a break, or after a release found them stale
 	uint64_t rescans;  ///< Times every lease was checked because notifications were lost
