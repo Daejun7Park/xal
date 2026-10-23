@@ -800,6 +800,20 @@ int
 xal_extents_release(struct xal *xal, struct xal_inode *inode);
 
 /**
+ * xal_extents_release() for a caller that read only [offset, offset + length) through the extents
+ *
+ * The check maps only the blocks holding that range again, one FIEMAP call per 256 extents in
+ * them, and compares the extents within them; changes elsewhere in the file are not seen. With
+ * length 0, or offset at or past the file's size, nothing is mapped. With
+ * xal_opts.lease_no_recheck it is xal_extents_release().
+ *
+ * @return As xal_extents_release().
+ */
+int
+xal_extents_release_range(struct xal *xal, struct xal_inode *inode, uint64_t offset,
+			  uint64_t length);
+
+/**
  * Say whether the readers of a file's extents should release them
  *
  * With XAL_WATCHMODE_READ_LEASE, a writer that opens or truncates a held file waits for its

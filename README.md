@@ -160,8 +160,11 @@ garbage collection does. The release therefore also maps the file again and
 returns `-ESTALE` when its extents changed, at the cost of a FIEMAP per
 release; on XFS, releases of files that have ever shared blocks, as copies
 made by `cp --reflink` have, also wait for each other on the allocation
-group. `xal_opts.lease_no_recheck` leaves the FIEMAP out. Writes to the block
-device itself are not seen.
+group. `xal_opts.lease_no_recheck` leaves the FIEMAP out.
+`xal_extents_release_range()` maps only the blocks of the range the caller
+read, so a file of many extents costs one FIEMAP call per 256 extents of
+that range rather than of the whole file. Writes to the block device itself
+are not seen.
 
 It does not support `shm_name`. A file with delayed allocation, inline,
 encoded or encrypted data is refused with `-EOPNOTSUPP`. See

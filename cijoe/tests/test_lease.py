@@ -484,6 +484,94 @@ def test_lease_release_stale_when_break_seen_late(cijoe):
     cijoe.run(f"rm -f {path}")
 
 
+def test_lease_release_range_stale_after_dedupe_inside(cijoe):
+    """A release of a range finds a dedupe into a block of that range, as a whole release does."""
+
+    dev_path, mountpoint = _require_fixture(cijoe)
+    held, twin = f"{mountpoint}/xal_lease_range_in", f"{mountpoint}/xal_lease_range_in_twin"
+    _fill(cijoe, held, "E", 65536)
+    _fill(cijoe, twin, "E", 4096)
+
+    pid, _, log = _start_hold(cijoe, dev_path, mountpoint, held, "--range 8192:8192")
+    try:
+        out = _capture(cijoe, f"sudo xfs_io -r -c 'dedupe {twin} 0 8192 4096' {held}")
+        assert "deduped 4096/4096" in out, f"dedupe did not go through:\n{out}"
+
+        cijoe.run(f"sudo kill -USR1 {pid}")
+        err = int(_wait_for(log, RELEASED_RE, 10).group(1))
+        assert err == -ESTALE, f"release of the range returned {err} after a dedupe in it"
+    finally:
+        _stop_hold(cijoe, pid)
+
+    cijoe.run(f"rm -f {held} {twin}")
+
+
+def test_lease_release_range_cuts_extents_to_the_range(cijoe):
+    """A dedupe outside the range splits the extent that holds the range; the release of the
+    range compares only the blocks within it, so it reports no change, and the next whole release
+    finds the dedupe."""
+
+    dev_path, mountpoint = _require_fixture(cijoe)
+    held, twin = f"{mountpoint}/xal_lease_range_out", f"{mountpoint}/xal_lease_range_out_twin"
+    _fill(cijoe, held, "E", 65536)
+    _fill(cijoe, twin, "E", 4096)
+
+    pid, byte, log = _start_hold(cijoe, dev_path, mountpoint, held, "--range 8192:8192")
+    try:
+        out = _capture(cijoe, f"sudo xfs_io -r -c 'fiemap' {held}")
+        assert len(re.findall(r"^\s*\d+:", out, re.M)) == 1, f"not one extent:\n{out}"
+        out = _capture(cijoe, f"sudo xfs_io -r -c 'dedupe {twin} 0 32768 4096' {held}")
+        assert "deduped 4096/4096" in out, f"dedupe did not go through:\n{out}"
+        out = _capture(cijoe, f"sudo xfs_io -r -c 'fiemap' {held}")
+        assert len(re.findall(r"^\s*\d+:", out, re.M)) >= 2, f"the extent did not split:\n{out}"
+
+        cijoe.run(f"sudo kill -USR1 {pid}")
+        err = int(_wait_for(log, RELEASED_RE, 10).group(1))
+        assert err == 0, f"release of the range returned {err} after a dedupe outside it"
+        m = _wait_for(log, re.compile(REACQUIRED_RE.pattern + r" release=(-?\d+)"), 30)
+        assert int(m.group(1)) == byte, "the range release dropped the mapping"
+        assert int(m.group(3)) == -ESTALE, f"whole release returned {m.group(3)} after the dedupe"
+    finally:
+        _stop_hold(cijoe, pid)
+
+    cijoe.run(f"rm -f {held} {twin}")
+
+
+def _range_on_holes(cijoe, name, dedupe_at):
+    """Hold a file of four one-block extents with holes between them, with --range on the third
+    (block 4), dedupe one block at dedupe_at, and return what the release of the range says."""
+
+    dev_path, mountpoint = _require_fixture(cijoe)
+    held, twin = f"{mountpoint}/{name}", f"{mountpoint}/{name}_twin"
+    writes = " ".join(f"-c 'pwrite -q -S 0x45 {k * 8}k 4k'" for k in range(4))
+    cijoe.run(f"xfs_io -f {writes} -c fsync {held}")
+    _fill(cijoe, twin, "E", 4096)
+
+    pid, _, log = _start_hold(cijoe, dev_path, mountpoint, held, "--range 16384:4096")
+    try:
+        assert re.search(r"extents=4\b", log.read_text()), log.read_text()
+        out = _capture(cijoe, f"sudo xfs_io -r -c 'dedupe {twin} 0 {dedupe_at} 4096' {held}")
+        assert "deduped 4096/4096" in out, f"dedupe did not go through:\n{out}"
+
+        cijoe.run(f"sudo kill -USR1 {pid}")
+        err = int(_wait_for(log, RELEASED_RE, 10).group(1))
+    finally:
+        _stop_hold(cijoe, pid)
+
+    cijoe.run(f"rm -f {held} {twin}")
+    return err
+
+
+def test_lease_release_range_past_the_first_extent(cijoe):
+    """The release of a range deep in the file compares the extents found for it by bisection:
+    a dedupe of the block in the range is found, one of the next extent is not."""
+
+    err = _range_on_holes(cijoe, "xal_lease_range_holes_in", 16384)
+    assert err == -ESTALE, f"release of the range returned {err} after a dedupe in it"
+    err = _range_on_holes(cijoe, "xal_lease_range_holes_out", 24576)
+    assert err == 0, f"release of the range returned {err} after a dedupe outside it"
+
+
 def test_lease_recheck_ignores_shared_split(cijoe):
     """Cloning part of the held file into another file breaks no lease and moves no data, but
     XFS then reports the held file's mapping split where it is shared, which the recheck must not
