@@ -113,3 +113,40 @@ def test_none_retries_a_failed_reindex(cijoe):
     finally:
         _stop_server(cijoe, pid)
         cijoe.run(f"rm -rf {subtree} {subtree}.away")
+
+
+def test_none_skips_a_write_leased_file(cijoe):
+    """In XAL_WATCHMODE_NONE, a re-index does not open a file a reader holds a write lease on
+    through xal_extents_attach_fd(), which would break the lease and fail the re-index until the
+    reader gave it up. The file is indexed as one XAL_EXTENT_NOADDR extent until the reader
+    detaches it."""
+
+    dev_path, mountpoint = _require_mount(cijoe)
+    leased = f"{mountpoint}/xal_server_leased"
+    new = f"{mountpoint}/xal_server_new"
+
+    cijoe.run(f"rm -f {leased} {new}")
+    pid = _start_server(cijoe, dev_path, mountpoint)
+    try:
+        err, _ = cijoe.run(f"xal_test_shm_write_lease {SHM_NAME} {leased} {new} 5000")
+        assert not err, "a write-leased file held up the re-index or lost its lease"
+    finally:
+        _stop_server(cijoe, pid)
+        cijoe.run(f"rm -f {leased} {new}")
+
+
+def test_none_maps_a_file_whose_leaseholder_died(cijoe):
+    """A record of a write lease whose process is gone does not keep the file out of the index."""
+
+    dev_path, mountpoint = _require_mount(cijoe)
+    leased = f"{mountpoint}/xal_server_leased"
+    new = f"{mountpoint}/xal_server_new"
+
+    cijoe.run(f"rm -f {leased} {new}")
+    pid = _start_server(cijoe, dev_path, mountpoint)
+    try:
+        err, _ = cijoe.run(f"xal_test_shm_write_lease {SHM_NAME} {leased} {new} 5000 dead")
+        assert not err, "a dead reader's record kept the file out of the index"
+    finally:
+        _stop_server(cijoe, pid)
+        cijoe.run(f"rm -f {leased} {new}")

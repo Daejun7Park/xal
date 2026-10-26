@@ -48,4 +48,15 @@ xal_test_mark_dirty_exe = executable(
   install: true,
 )
 
+# A reader's write lease and xal-server's NONE re-index, for the cijoe test of skipping the file.
+xal_test_shm_write_lease_exe = executable(
+  'xal_test_shm_write_lease',
+  'test_shm_write_lease.c',
+  dependencies: xallib_deps,
+  link_with: xal_library,
+  include_directories: include_dirs,
+  install_rpath: xallib_rpath,
+  install: true,
+)
+
 subdir('xal-server')
