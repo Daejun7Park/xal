@@ -2,6 +2,7 @@
 #define XAL_BE_FIEMAP_H
 
 struct xal_reflink;
+struct xal_lease_set;
 
 /**
  * Basename prefix of the per-session reflink shadow directory: <mnt>/.xal_snapshot.<pid>
@@ -20,7 +21,7 @@ struct xal_be_fiemap {
 
 	struct xal_reflink *reflink; ///< Reflink-snapshot state; non-NULL in XAL_WATCHMODE_REFLINK_SNAPSHOT
 
-	uint8_t _rsvd[8];
+	struct xal_lease_set *lease;  ///< Read-lease state; non-NULL in XAL_WATCHMODE_READ_LEASE
 };
 XAL_STATIC_ASSERT(sizeof(struct xal_be_fiemap) == XAL_BACKEND_SIZE, "Incorrect size");
 
