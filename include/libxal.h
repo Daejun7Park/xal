@@ -76,6 +76,17 @@ enum xal_watchmode {
 	 * has moved on, not that anything in hand went bad.
 	 */
 	XAL_WATCHMODE_REFLINK_SNAPSHOT = 1,
+
+	/**
+	 * FIEMAP backend only; xal_open() refuses it for XAL_BACKEND_XFS and with
+	 * xal_opts.shm_name with -ENOTSUP. xal_index() builds the tree without extents;
+	 * xal_extents_acquire() maps a file on first use while holding a read lease on it
+	 * (F_SETLEASE, F_RDLCK), so that a writer's open() or truncate() of the file waits until
+	 * the callers between xal_extents_acquire() and xal_extents_release() are done. While a
+	 * handle in this mode is open, a thread of xal's takes SIGRTMIN+7 and SIGIO; see README.md.
+	 * Not 2, which configs written for the removed extent-update mode still name.
+	 */
+	XAL_WATCHMODE_READ_LEASE = 3,
 };
 
 enum xal_file_lookupmode {
@@ -398,7 +409,8 @@ xal_dinodes_retrieve(struct xal *xal);
  * XAL_BACKEND_FIEMAP writes each file's dirty data back before mapping it, so delayed allocations
  * map to the blocks they got. When a writeback of the file failed, then or earlier, that flush
  * still writes the file back but then reports the failure, which says nothing about the mapping:
- * in XAL_WATCHMODE_NONE the file is then mapped again without it instead of failing the index.
+ * in XAL_WATCHMODE_NONE the file is then mapped again without it instead of failing the index;
+ * in XAL_WATCHMODE_READ_LEASE, instead of failing xal_extents_acquire().
  * Its extents describe its blocks, which for the range that failed need not hold what the page
  * cache does: that range maps as a hole, as unwritten, or as blocks still holding the data from
  * before. fsync() on the file still reports the failure; the flush clears only the error the
@@ -433,7 +445,8 @@ xal_dinodes_retrieve(struct xal *xal);
  * the index skips. A caller that re-indexes from its own thread while a watch runs can therefore
  * cost one extra re-index.
  *
- * This function will fail if given a xal handle obtained from xal_from_shm().
+ * This function will fail if given a xal handle obtained from xal_from_shm(), and with
+ * XAL_WATCHMODE_READ_LEASE it fails with -EBUSY while extents are held, see xal_extents_acquire().
  *
  * @returns On success, 0 is returned. On error, negative errno is returned to indicate the error.
  */
@@ -677,6 +690,58 @@ xal_build_lookup_hashmap(struct xal *xal);
  */
 int
 xal_get_extents(struct xal *xal, char *path, struct xal_extents **extents);
+
+/**
+ * Pin the extents of a regular file for raw reads
+ *
+ * With XAL_WATCHMODE_READ_LEASE, the first call for a file opens it read-only, takes a read lease
+ * on it and maps it as xal_index() does, leaving out extents past the end of the file or cutting
+ * them at the block holding it. Each call counts the caller as a reader until
+ * xal_extents_release(). A writer's open() or truncate() of the file breaks the lease; the writer
+ * waits until the last reader has released, xal then releases the lease, and the next call maps
+ * the file again. Between the two calls the extents therefore describe the file's blocks, unless a
+ * writeback of the file failed, see xal_index(). In other watch modes this returns the indexed
+ * extents and pins nothing.
+ *
+ * Every successful call must be paired with xal_extents_release() on the same inode. Neither may
+ * run concurrently with xal_index() or xal_close() on the same handle, and xal_index() fails with
+ * -EBUSY while extents are held.
+ *
+ * @param xal The xal struct obtained when opened with xal_open() or xal_open_from_uri()
+ * @param inode A regular file in the index
+ * @param extents Set to the file's extents on success
+ *
+ * @return On success, 0. -EAGAIN when the file is open for writing or its lease is being
+ * recalled, -ESTALE when the indexed path now names another file, -EMFILE when the process is out
+ * of descriptors, as every mapped file holds one, other negative errno on error.
+ */
+int
+xal_extents_acquire(struct xal *xal, struct xal_inode *inode, struct xal_extents **extents);
+
+/**
+ * Count the caller out as a reader of a file's extents
+ *
+ * @param xal The xal struct obtained when opened with xal_open() or xal_open_from_uri()
+ * @param inode The inode passed to xal_extents_acquire()
+ *
+ * @return On success, 0. -EINVAL when the file has no reader to count out.
+ */
+int
+xal_extents_release(struct xal *xal, struct xal_inode *inode);
+
+struct xal_lease_stats {
+	uint64_t mapped;  ///< Files mapped under a lease, counting re-maps
+	uint64_t refused; ///< Lease attempts refused because the file was open for writing
+	uint64_t breaks;  ///< Lease-break notifications received
+	uint64_t revoked; ///< Leases released after a break
+	uint64_t rescans; ///< Times every lease was checked because notifications were lost
+};
+
+/**
+ * Counters of XAL_WATCHMODE_READ_LEASE; -EINVAL in other watch modes
+ */
+int
+xal_lease_stats(struct xal *xal, struct xal_lease_stats *stats);
 
 /**
  * Retrieve the directory entries for the directory at the given path.
