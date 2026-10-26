@@ -1027,12 +1027,132 @@ fiemap_extent_flag(uint32_t fe_flags)
 	return flag;
 }
 
+int
+xal_state_lease_lock(struct xal *xal, int timeout_ms)
+{
+	pthread_mutex_t *lock = &xal->state->lease_lock;
+	struct timespec ts;
+	int err;
+
+	clock_gettime(CLOCK_REALTIME, &ts);
+	ts.tv_sec += timeout_ms / 1000;
+	ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000;
+	if (ts.tv_nsec >= 1000000000L) {
+		ts.tv_sec++;
+		ts.tv_nsec -= 1000000000L;
+	}
+	err = pthread_mutex_timedlock(lock, &ts);
+	/* A record is published by its ino, stored last, so one left half-done reads as free */
+	if (err == EOWNERDEAD) {
+		err = pthread_mutex_consistent(lock);
+	}
+
+	return err == ETIMEDOUT ? -EAGAIN : -err;
+}
+
+void
+xal_state_lease_unlock(struct xal *xal)
+{
+	pthread_mutex_unlock(&xal->state->lease_lock);
+}
+
+/* Whether another open file than fd's holds the OFD lock of a slot */
+static bool
+write_lease_held(int fd, uint32_t slot)
+{
+	struct flock fl = {.l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = slot, .l_len = 1};
+
+	/* A failed query keeps the record: the file then stays unmapped, and its lease whole */
+	if (fcntl(fd, F_OFD_GETLK, &fl)) {
+		return true;
+	}
+
+	return fl.l_type != F_UNLCK;
+}
+
+/* The slots to scan, bounded, as any reader can write the count */
+static uint32_t
+write_leases_count(const struct xal_shared_state *state)
+{
+	uint32_t n = atomic_load_explicit(&state->nwrite_leases, memory_order_relaxed);
+
+	return n < XAL_SHM_WRITE_LEASES ? n : XAL_SHM_WRITE_LEASES;
+}
+
+/* Shorten the slots scanned to the last one in use */
+static void
+write_leases_trim(struct xal_shared_state *state)
+{
+	uint32_t n = write_leases_count(state);
+
+	while (n && !atomic_load(&state->write_leases[n - 1].ino)) {
+		n--;
+	}
+	atomic_store_explicit(&state->nwrite_leases, n, memory_order_relaxed);
+}
+
+bool
+xal_state_write_leased(struct xal *xal, uint64_t ino)
+{
+	struct xal_shared_state *state = xal->state;
+	uint32_t n = write_leases_count(state);
+	bool leased = false;
+
+	for (uint32_t i = 0; i < n; ++i) {
+		struct xal_shm_write_lease *r = &state->write_leases[i];
+
+		if (atomic_load(&r->ino) != ino) {
+			continue;
+		}
+		/* The reader's descriptor of the state is gone, and with it the lease */
+		if (!write_lease_held(xal->state_fd, i)) {
+			atomic_store(&r->ino, 0);
+			continue;
+		}
+		r->flags |= XAL_SHM_WRITE_LEASE_SKIPPED;
+		leased = true;
+	}
+	write_leases_trim(state);
+
+	return leased;
+}
+
+/*
+ * A write-leased file is indexed as one XAL_EXTENT_NOADDR extent over its size, which tells other
+ * readers to go through the filesystem for it; the leaseholder maps it through its own descriptor
+ */
+static int
+index_write_leased(struct xal *xal, char *path, struct xal_inode *inode)
+{
+	struct xal_be_fiemap *be = (struct xal_be_fiemap *)&xal->be;
+	struct xal_extent *extent;
+	int err;
+
+	inode->content.extents.count = 0;
+	if (inode->size) {
+		err = xal_pool_claim_extents(&xal->extents, 1, &inode->content.extents.extent_idx);
+		if (err) {
+			XAL_DEBUG("FAILED: xal_pool_claim_extents(); err(%d)", err);
+			return err;
+		}
+		extent = xal_extent_at(xal, inode->content.extents.extent_idx);
+		extent->start_offset = 0;
+		extent->start_block = 0;
+		extent->nblocks = (inode->size + xal->sb.blocksize - 1) / xal->sb.blocksize;
+		extent->flag = XAL_EXTENT_NOADDR;
+		inode->content.extents.count = 1;
+	}
+
+	return be->path_inode_map ? path_map_insert(be->path_inode_map, path, inode) : 0;
+}
+
 static int
 xal_be_fiemap_process_inode_file(struct xal *xal, char *path, struct xal_inode *inode)
 {
 	struct xal_be_fiemap *be = (struct xal_be_fiemap *)&xal->be;
 	struct fiemap *fiemap = NULL;
 	int fd, map_fd, clone_fd = -1, err = 0;
+	bool leased = false;
 	struct stat st;
 
 	if (!xal_inode_is_file(inode)) {
@@ -1046,8 +1166,33 @@ xal_be_fiemap_process_inode_file(struct xal *xal, char *path, struct xal_inode *
 		return be->path_inode_map ? path_map_insert(be->path_inode_map, path, inode) : 0;
 	}
 
+	/*
+	 * A file a reader of the published region holds a write lease on is not opened, as any
+	 * open() would break the lease and fail with EWOULDBLOCK until the reader gave it up. The
+	 * check and the open() are made under the lock the reader records under before it takes the
+	 * lease. A reader stopped while holding it fails the index rather than stalling it.
+	 */
+	if (xal->state) {
+		err = xal_state_lease_lock(xal, XAL_FIEMAP_LEASE_LOCK_MS);
+		if (err) {
+			XAL_DEBUG("FAILED: xal_state_lease_lock(); err(%d)", err);
+			return err;
+		}
+		leased = xal_state_write_leased(xal, inode->ino);
+	}
 	/* An entry replaced since it was classified is neither followed nor blocked on. */
-	fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+	fd = leased ? -1 : open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+	if (xal->state) {
+		int open_errno = errno;
+
+		xal_state_lease_unlock(xal);
+		errno = open_errno;
+	}
+	if (leased) {
+		XAL_DEBUG("INFO: %s is write-leased by a reader; indexed as XAL_EXTENT_NOADDR",
+			  path);
+		return index_write_leased(xal, path, inode);
+	}
 	if (fd < 0) {
 		XAL_DEBUG("FAILED: open(%s); errno(%d)", path, errno);
 		return errno == ELOOP ? -EAGAIN : -errno;

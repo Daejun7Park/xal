@@ -25,6 +25,26 @@ struct xal_be_fiemap {
 };
 XAL_STATIC_ASSERT(sizeof(struct xal_be_fiemap) == XAL_BACKEND_SIZE, "Incorrect size");
 
+/** Longest the index waits for a reader holding the records' lock */
+#define XAL_FIEMAP_LEASE_LOCK_MS 100
+
+/**
+ * Take the shared state's lease_lock, waiting at most timeout_ms; -EAGAIN when the wait timed out
+ */
+int
+xal_state_lease_lock(struct xal *xal, int timeout_ms);
+
+void
+xal_state_lease_unlock(struct xal *xal);
+
+/**
+ * Whether a reader holds a write lease on the file with this inode number, for an index that then
+ * skips it; marks its records XAL_SHM_WRITE_LEASE_SKIPPED
+ */
+bool
+xal_state_write_leased(struct xal *xal, uint64_t ino);
+
+
 void
 xal_be_fiemap_close(struct xal *xal);
 

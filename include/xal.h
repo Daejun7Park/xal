@@ -1,7 +1,9 @@
 #ifndef XAL_H
 #define XAL_H
 
+#include <pthread.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include <xal_pool.h>
 
@@ -39,7 +41,27 @@ enum xal_state {
  * contents mean: changing xal_inode.name from an assembled path to a leaf name leaves every size
  * and offset intact and still requires a bump.
  */
-#define XAL_SHM_VERSION 3
+#define XAL_SHM_VERSION 4
+
+/**
+ * Most files the readers of a region may hold a write lease on at once; see
+ * xal_extents_attach_fd()
+ */
+#define XAL_SHM_WRITE_LEASES 4096
+
+#define XAL_SHM_WRITE_LEASE_SKIPPED 1 ///< An index left the file unmapped while recorded
+
+/**
+ * A file a reader of the region holds a write lease on: the primary's index does not open it, as
+ * any open() of the file would break the lease. Slot i is held by an OFD lock on byte i of the
+ * state object, taken through the reader's descriptor of it, so a record whose lock is gone,
+ * as when the reader exited, is ignored.
+ */
+struct xal_shm_write_lease {
+	_Atomic uint64_t ino; ///< 0 for a free slot
+	int32_t pid;	      ///< The reader's, as it sees it; for diagnostics only
+	uint32_t flags;	      ///< XAL_SHM_WRITE_LEASE_SKIPPED
+};
 
 struct xal_shared_state {
 	_Atomic uint64_t magic; ///< XAL_SHM_MAGIC, stored last, so zero means not yet published
@@ -50,6 +72,13 @@ struct xal_shared_state {
 	char subtree[XAL_PATH_MAXLEN]; ///< Empty when the index covers the whole mount
 	atomic_int index_state; ///< One of enum xal_state
 	atomic_int seq_lock; ///< Even when stable; odd while the pools are being rewritten in place
+
+	/* Orders the index's check of write_leases and its open() of a file against a reader's
+	 * record. Robust and process-shared, as a reader may die holding it. Its layout is the C
+	 * library's, so primary and readers must use the same one. */
+	pthread_mutex_t lease_lock;
+	_Atomic uint32_t nwrite_leases; ///< Slots of write_leases up to the last in use
+	struct xal_shm_write_lease write_leases[XAL_SHM_WRITE_LEASES];
 };
 XAL_STATIC_ASSERT(offsetof(struct xal_shared_state, magic) == 0, "shm ABI");
 XAL_STATIC_ASSERT(offsetof(struct xal_shared_state, version) == 8, "shm ABI");
@@ -74,6 +103,7 @@ struct xal {
 	atomic_int *seq_lock;    ///< An uneven number indicates the struct is being modified and is not safe to read; may point to external shared memory
 	atomic_int _seq_lock_storage; ///< Backing store for seq_lock when shm_name is not set
 	struct xal_shared_state *state; ///< Mapped shared state region; non-NULL when shm_name was set
+	int state_fd; ///< Descriptor of the state object while state is mapped, for its OFD locks
 	char *state_shm_name;           ///< Name of the _state shm region; set by primary only, for unlink on close
 	enum xal_procrole procrole;
 

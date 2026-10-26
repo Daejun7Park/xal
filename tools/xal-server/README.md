@@ -137,6 +137,11 @@ on each failure, up to a second. A re-index maps every file anew and first write
 back, so marks that come faster than a re-index completes keep the index dirty, and readers
 retrying on `-ESTALE` wait for them all.
 
+A reader that holds a write lease on a file through `xal_extents_attach_fd()` records it in the
+region. A re-index does not open that file, as any open would break the lease, and indexes it as
+one `XAL_EXTENT_NOADDR` extent until the reader detaches it; the record of a reader that exited
+is ignored from the next re-index on.
+
 ### Reader protocol
 
 A reader works against the shared region by reference and validates the sequence lock around use:

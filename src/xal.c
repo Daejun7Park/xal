@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <libxal.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -105,6 +106,7 @@ xal_close(struct xal *xal)
 		if (xal->state_shm_name) {
 			shm_unlink(xal->state_shm_name);
 			free(xal->state_shm_name);
+			close(xal->state_fd);
 		}
 		munmap(xal->state, sizeof(struct xal_shared_state));
 	}
@@ -156,6 +158,7 @@ publish_shared_state(struct xal *xal, const char *shm_name, const char *mountpoi
 {
 	char shm_name_state[XAL_PATH_MAXLEN + 9];
 	struct xal_shared_state *state;
+	pthread_mutexattr_t attr;
 	int fd, err;
 
 	snprintf(shm_name_state, sizeof(shm_name_state), "%s_state", shm_name);
@@ -175,12 +178,13 @@ publish_shared_state(struct xal *xal, const char *shm_name, const char *mountpoi
 		return err;
 	}
 
+	/* Kept open: the index queries the readers' OFD locks on the object through it */
 	state =
 	    mmap(NULL, sizeof(struct xal_shared_state), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-	close(fd);
 	if (state == MAP_FAILED) {
 		XAL_DEBUG("FAILED: mmap(); errno(%d)", errno);
 		err = -errno;
+		close(fd);
 		shm_unlink(shm_name_state);
 		return err;
 	}
@@ -189,11 +193,13 @@ publish_shared_state(struct xal *xal, const char *shm_name, const char *mountpoi
 	if (!xal->state_shm_name) {
 		XAL_DEBUG("FAILED: strdup(); errno(%d)", errno);
 		munmap(state, sizeof(struct xal_shared_state));
+		close(fd);
 		shm_unlink(shm_name_state);
 		return -ENOMEM;
 	}
 
 	xal->state = state;
+	xal->state_fd = fd;
 	xal->index_state = &state->index_state;
 	xal->seq_lock = &state->seq_lock;
 
@@ -217,6 +223,24 @@ publish_shared_state(struct xal *xal, const char *shm_name, const char *mountpoi
 			strncpy(state->subtree, fiemap_be->subtree, XAL_PATH_MAXLEN - 1);
 			state->subtree[XAL_PATH_MAXLEN - 1] = '\0';
 		}
+	}
+
+	pthread_mutexattr_init(&attr);
+	pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+	pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
+	err = pthread_mutex_init(&state->lease_lock, &attr);
+	pthread_mutexattr_destroy(&attr);
+	if (err) {
+		XAL_DEBUG("FAILED: pthread_mutex_init(); err(%d)", err);
+		xal->state = NULL;
+		xal->index_state = &xal->_index_state_storage;
+		xal->seq_lock = &xal->_seq_lock_storage;
+		free(xal->state_shm_name);
+		xal->state_shm_name = NULL;
+		munmap(state, sizeof(struct xal_shared_state));
+		close(fd);
+		shm_unlink(shm_name_state);
+		return -err;
 	}
 
 	atomic_store_explicit(&state->magic, XAL_SHM_MAGIC, memory_order_release);
