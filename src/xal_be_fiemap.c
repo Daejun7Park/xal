@@ -355,6 +355,7 @@ xal_be_fiemap_close(struct xal *xal)
 
 	if (xal->procrole == XAL_PROCROLE_SECONDARY) {
 		XAL_DEBUG("INFO: secondary; watcher and snapshot belong to the primary");
+		xal_be_fiemap_lease_shadow_close(xal);
 	} else {
 		// The watch thread is joined first: purging the clones unlinks paths the mountpoint
 		// watch reports on.
@@ -1034,14 +1035,18 @@ xal_state_lease_lock(struct xal *xal, int timeout_ms)
 	struct timespec ts;
 	int err;
 
-	clock_gettime(CLOCK_REALTIME, &ts);
-	ts.tv_sec += timeout_ms / 1000;
-	ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000;
-	if (ts.tv_nsec >= 1000000000L) {
-		ts.tv_sec++;
-		ts.tv_nsec -= 1000000000L;
+	if (timeout_ms < 0) {
+		err = pthread_mutex_lock(lock);
+	} else {
+		clock_gettime(CLOCK_REALTIME, &ts);
+		ts.tv_sec += timeout_ms / 1000;
+		ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000;
+		if (ts.tv_nsec >= 1000000000L) {
+			ts.tv_sec++;
+			ts.tv_nsec -= 1000000000L;
+		}
+		err = pthread_mutex_timedlock(lock, &ts);
 	}
-	err = pthread_mutex_timedlock(lock, &ts);
 	/* A record is published by its ino, stored last, so one left half-done reads as free */
 	if (err == EOWNERDEAD) {
 		err = pthread_mutex_consistent(lock);
@@ -1115,6 +1120,74 @@ xal_state_write_leased(struct xal *xal, uint64_t ino)
 	write_leases_trim(state);
 
 	return leased;
+}
+
+int
+xal_state_write_lease_add(struct xal *xal, uint64_t ino)
+{
+	struct xal_shared_state *state = xal->state;
+	struct flock fl = {.l_type = F_WRLCK, .l_whence = SEEK_SET, .l_len = 1};
+	uint32_t n = write_leases_count(state), i;
+	struct xal_shm_write_lease *r;
+
+	for (i = 0; i < n; ++i) {
+		if (!atomic_load(&state->write_leases[i].ino)) {
+			break;
+		}
+	}
+	if (i == XAL_SHM_WRITE_LEASES) {
+		char path[32];
+		int qfd;
+
+		/* A query through this handle's own open file would not see its own locks */
+		snprintf(path, sizeof(path), "/proc/self/fd/%d", xal->state_fd);
+		qfd = open(path, O_RDONLY | O_CLOEXEC);
+		if (qfd < 0) {
+			return -ENOSPC;
+		}
+		for (i = 0; i < XAL_SHM_WRITE_LEASES; ++i) {
+			if (!write_lease_held(qfd, i)) {
+				break;
+			}
+		}
+		close(qfd);
+		if (i == XAL_SHM_WRITE_LEASES) {
+			return -ENOSPC;
+		}
+		/* The file of a reader that died stays unmapped until an index maps it again */
+		if (state->write_leases[i].flags & XAL_SHM_WRITE_LEASE_SKIPPED) {
+			xal_mark_dirty(xal);
+		}
+	}
+
+	fl.l_start = i;
+	if (fcntl(xal->state_fd, F_OFD_SETLK, &fl)) {
+		return -errno;
+	}
+	r = &state->write_leases[i];
+	r->pid = getpid();
+	r->flags = 0;
+	atomic_store_explicit(&r->ino, ino, memory_order_release);
+	if (i >= n) {
+		atomic_store_explicit(&state->nwrite_leases, i + 1, memory_order_relaxed);
+	}
+
+	return i;
+}
+
+bool
+xal_state_write_lease_del(struct xal *xal, int slot)
+{
+	struct xal_shared_state *state = xal->state;
+	struct flock fl = {.l_type = F_UNLCK, .l_whence = SEEK_SET, .l_start = slot, .l_len = 1};
+	struct xal_shm_write_lease *r = &state->write_leases[slot];
+	bool skipped = r->flags & XAL_SHM_WRITE_LEASE_SKIPPED;
+
+	atomic_store(&r->ino, 0);
+	fcntl(xal->state_fd, F_OFD_SETLK, &fl);
+	write_leases_trim(state);
+
+	return skipped;
 }
 
 /*

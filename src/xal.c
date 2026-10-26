@@ -65,6 +65,15 @@ xal_inode_at(struct xal *xal, uint32_t idx)
 struct xal_extent *
 xal_extent_at(struct xal *xal, uint32_t idx)
 {
+	/* A file this process attached to a handle from xal_from_shm(), mapped in its own pool */
+	if (idx >= XAL_EXTENT_SHADOW_BASE) {
+		struct xal *shadow = atomic_load_explicit(&xal->shadow, memory_order_acquire);
+
+		if (shadow) {
+			xal = shadow;
+			idx -= XAL_EXTENT_SHADOW_BASE;
+		}
+	}
 	if (idx >= xal->extents.allocated) {
 		return NULL;
 	}
@@ -106,9 +115,9 @@ xal_close(struct xal *xal)
 		if (xal->state_shm_name) {
 			shm_unlink(xal->state_shm_name);
 			free(xal->state_shm_name);
-			close(xal->state_fd);
 		}
 		munmap(xal->state, sizeof(struct xal_shared_state));
+		close(xal->state_fd);
 	}
 
 	free(xal);
@@ -586,7 +595,7 @@ xal_from_shm(const char *shm_name, struct xal **out)
 	size_t inodes_size, extents_size;
 	void *inodes_mem, *extents_mem;
 	uint64_t magic;
-	int shm_fd = -1, err;
+	int shm_fd = -1, state_fd, err;
 
 	xal = calloc(1, sizeof(*xal));
 	if (!xal) {
@@ -628,14 +637,14 @@ xal_from_shm(const char *shm_name, struct xal **out)
 
 	state = mmap(NULL, sizeof(struct xal_shared_state), PROT_READ | PROT_WRITE, MAP_SHARED,
 		     shm_fd, 0);
-	close(shm_fd);
-	shm_fd = -1;
-
 	if (state == MAP_FAILED) {
 		err = -errno;
 		fprintf(stderr, "Failed: mmap(state); err(%d)\n", err);
 		goto failed;
 	}
+	/* Kept open: the OFD locks of the write leases recorded through this handle hang on it */
+	state_fd = shm_fd;
+	shm_fd = -1;
 
 	magic = atomic_load_explicit(&state->magic, memory_order_acquire);
 	if (!magic) {
@@ -653,6 +662,8 @@ xal_from_shm(const char *shm_name, struct xal **out)
 	}
 
 	xal->state = state;
+	xal->state_fd = state_fd;
+	xal->pid = getpid();
 	xal->index_state = &state->index_state;
 	xal->seq_lock = &state->seq_lock;
 	xal->sb = state->sb;
@@ -758,6 +769,7 @@ unmap_inodes:
 	munmap(inodes_mem, inodes_size);
 unmap_state:
 	munmap(state, sizeof(struct xal_shared_state));
+	close(state_fd);
 failed:
 	free(xal);
 

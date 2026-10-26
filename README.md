@@ -182,6 +182,13 @@ It does not support `shm_name`. A file with delayed allocation, inline,
 encoded or encrypted data is refused with `-EOPNOTSUPP`. See
 `xal_extents_acquire()` and `xal_extents_release()` in `include/libxal.h`.
 
+A reader attached to a published index with `xal_from_shm()` can lease the
+files it attaches with `xal_extents_attach_fd()`, whatever the index's watch
+mode. A write lease is recorded in the shared state first, and the primary's
+index does not open a recorded file, which would break the lease, but indexes
+it as one `XAL_EXTENT_NOADDR` extent, so other readers go through the
+filesystem for it.
+
 #### File lookup modes
 
 The path-based inode and extent lookup implementation depends on which

@@ -45,9 +45,12 @@ struct xal_lease_entry {
 	int ufd; ///< The caller's descriptor from xal_extents_attach_fd(), never closed; -1 if none
 	int ltype;	       ///< F_RDLCK, or F_WRLCK on a caller's descriptor open for writing
 	struct timespec ctime; ///< The file's ctime once the lease was taken, for a write lease
+	int record; ///< In a shadow: the region's record slot of the write lease; -1 if none
+	uint32_t attaching; ///< In a shadow: attaches of the file under way; lease_shadow_lock
 };
 
 KHASH_MAP_INIT_INT(fd_to_idx, uint32_t)
+KHASH_MAP_INIT_INT64(ino_to_idx, uint32_t)
 
 struct xal_lease_set {
 	struct xal *xal;
@@ -72,6 +75,10 @@ struct xal_lease_set {
 	struct xal_lease_stats stats;
 	struct xal_lease_set *next; ///< In the process-wide list of sets
 	bool recheck;		    ///< !xal_opts.lease_no_recheck
+	kh_ino_to_idx_t *ino_map;   ///< In a shadow: inode number to the inode copied for it
+	uint32_t nshadow;	    ///< In a shadow: inodes handed out, from the first
+	uint32_t *free_slots;	    ///< In a shadow: inodes of detached files, to reuse
+	uint32_t nfree;
 };
 
 int
@@ -93,5 +100,11 @@ xal_be_fiemap_lease_prepare(struct xal *xal);
 
 void
 xal_be_fiemap_lease_close(struct xal *xal);
+
+/**
+ * Release a secondary's attachments, and their records in the shared state; for its xal_close()
+ */
+void
+xal_be_fiemap_lease_shadow_close(struct xal *xal);
 
 #endif /* XAL_BE_FIEMAP_LEASE_H */

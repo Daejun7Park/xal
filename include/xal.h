@@ -104,6 +104,7 @@ struct xal {
 	atomic_int _seq_lock_storage; ///< Backing store for seq_lock when shm_name is not set
 	struct xal_shared_state *state; ///< Mapped shared state region; non-NULL when shm_name was set
 	int state_fd; ///< Descriptor of the state object while state is mapped, for its OFD locks
+	pid_t pid;    ///< The process of a handle from xal_from_shm(), which alone may attach files
 	char *state_shm_name;           ///< Name of the _state shm region; set by primary only, for unlink on close
 	enum xal_procrole procrole;
 
@@ -117,7 +118,14 @@ struct xal {
 	 * index and a successful one with a mark landing mid-rebuild both leave DIRTY with
 	 * seq_lock advanced, and want opposite treatment. Not set by the -EBUSY path. */
 	atomic_int last_index_err;
+
+	/* A secondary's own handle for the files it attached with xal_extents_attach_fd(), whose
+	 * extents xal_extent_at() finds at XAL_EXTENT_SHADOW_BASE and above; the shadow points at
+	 * itself. NULL otherwise. */
+	_Atomic(struct xal *) shadow;
 };
+
+#define XAL_EXTENT_SHADOW_BASE (1U << 31) ///< Extent indices from here are in xal->shadow's pool
 
 int
 search_by_traversal(struct xal *xal, struct xal_inode *root, char *path, char *basepath, struct xal_inode **inode);
