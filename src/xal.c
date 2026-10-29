@@ -64,6 +64,15 @@ xal_inode_at(struct xal *xal, uint32_t idx)
 struct xal_extent *
 xal_extent_at(struct xal *xal, uint32_t idx)
 {
+	/* A file this process attached to a handle from xal_from_shm(), mapped in its own pool */
+	if (idx >= XAL_EXTENT_SHADOW_BASE) {
+		struct xal *shadow = atomic_load_explicit(&xal->shadow, memory_order_acquire);
+
+		if (shadow) {
+			xal = shadow;
+			idx -= XAL_EXTENT_SHADOW_BASE;
+		}
+	}
 	if (idx >= xal->extents.allocated) {
 		return NULL;
 	}
@@ -152,7 +161,7 @@ retrieve_mountpoint(const char *dev_uri, char *mntpnt)
  */
 static int
 publish_shared_state(struct xal *xal, const char *shm_name, const char *mountpoint,
-		     enum xal_backend be)
+		     enum xal_backend be, enum xal_watchmode watch_mode)
 {
 	char shm_name_state[XAL_PATH_MAXLEN + 9];
 	struct xal_shared_state *state;
@@ -204,6 +213,7 @@ publish_shared_state(struct xal *xal, const char *shm_name, const char *mountpoi
 
 	state->version = XAL_SHM_VERSION;
 	state->type = be;
+	state->watch_mode = watch_mode;
 	state->sb = xal->sb;
 	strncpy(state->mountpoint, mountpoint, XAL_PATH_MAXLEN - 1);
 	state->mountpoint[XAL_PATH_MAXLEN - 1] = '\0';
@@ -270,7 +280,8 @@ xal_open_from_uri(const char *uri, struct xal **xal, struct xal_opts *opts)
 	}
 
 	if (opts->shm_name) {
-		err = publish_shared_state(*xal, opts->shm_name, mountpoint, opts->be);
+		err = publish_shared_state(*xal, opts->shm_name, mountpoint, opts->be,
+					   opts->watch_mode);
 		if (err) {
 			XAL_DEBUG("FAILED: publish_shared_state(); err(%d)", err);
 			xal_close(*xal);
@@ -384,7 +395,8 @@ xal_open(struct xnvme_dev *dev, struct xal **xal, struct xal_opts *opts)
 	(*xal)->sb.lba_blksze = 1U << ns->lbaf[fidx].ds;
 
 	if (opts->shm_name) {
-		err = publish_shared_state(*xal, opts->shm_name, mountpoint, opts->be);
+		err = publish_shared_state(*xal, opts->shm_name, mountpoint, opts->be,
+					   opts->watch_mode);
 		if (err) {
 			XAL_DEBUG("FAILED: publish_shared_state(); err(%d)", err);
 			xal_close(*xal);
@@ -1076,6 +1088,11 @@ xal_get_extents(struct xal *xal, char *path, struct xal_extents **extents)
 	if (!xal_inode_is_file(inode)) {
 		XAL_DEBUG("FAILED: inode at given path is not a file");
 		return -EINVAL;
+	}
+	/* Not an empty list, which a reader would take for a file without data */
+	if (xal_region_leased(xal)) {
+		XAL_DEBUG("FAILED: the region has no extents; attach the file instead");
+		return -ENOTSUP;
 	}
 
 	*extents = &inode->content.extents;

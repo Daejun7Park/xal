@@ -25,7 +25,6 @@ SWEEP_RE = re.compile(
 XAL_EXTENT_SHARED = 0x2  # enum xal_extent_flag
 FMR_OWN_FREE = "special_0:1"
 EINVAL = 22
-ENOTSUP = 95
 ESTALE = 116
 EAGAIN = 11
 EBUSY = 16
@@ -614,13 +613,13 @@ def test_lease_release_stale_with_no_descriptor_to_drop(cijoe):
     assert err == -ESTALE, f"release returned {err} with no descriptor to drop"
 
 
-def test_lease_rejects_shm(cijoe):
-    """Leases pin nothing for other processes, so a shared index is refused."""
+def test_lease_opens_with_shm(cijoe):
+    """A shared index opens in this mode; it has names only, see tests/test_server.py."""
 
     dev_path, mountpoint = _require_fixture(cijoe)
 
     out = _capture(cijoe, f"sudo xal_lease_hold {dev_path} {mountpoint} {mountpoint} --shm")
-    assert f"OPEN err=-{ENOTSUP}" in out, out
+    assert "OPEN err=0" in out, out
 
 
 def test_lease_attach_writer_waits_for_reader(cijoe):

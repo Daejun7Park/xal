@@ -39,7 +39,7 @@ enum xal_state {
  * contents mean: changing xal_inode.name from an assembled path to a leaf name leaves every size
  * and offset intact and still requires a bump.
  */
-#define XAL_SHM_VERSION 3
+#define XAL_SHM_VERSION 4
 
 struct xal_shared_state {
 	_Atomic uint64_t magic; ///< XAL_SHM_MAGIC, stored last, so zero means not yet published
@@ -50,6 +50,7 @@ struct xal_shared_state {
 	char subtree[XAL_PATH_MAXLEN]; ///< Empty when the index covers the whole mount
 	atomic_int index_state; ///< One of enum xal_state
 	atomic_int seq_lock; ///< Even when stable; odd while the pools are being rewritten in place
+	enum xal_watchmode watch_mode; ///< The primary's; READ_LEASE publishes no extents
 };
 XAL_STATIC_ASSERT(offsetof(struct xal_shared_state, magic) == 0, "shm ABI");
 XAL_STATIC_ASSERT(offsetof(struct xal_shared_state, version) == 8, "shm ABI");
@@ -87,7 +88,22 @@ struct xal {
 	 * index and a successful one with a mark landing mid-rebuild both leave DIRTY with
 	 * seq_lock advanced, and want opposite treatment. Not set by the -EBUSY path. */
 	atomic_int last_index_err;
+
+	/* A secondary's own handle for the files it attached with xal_extents_attach_fd(), whose
+	 * extents xal_extent_at() finds at XAL_EXTENT_SHADOW_BASE and above; the shadow points at
+	 * itself. NULL otherwise. */
+	_Atomic(struct xal *) shadow;
 };
+
+#define XAL_EXTENT_SHADOW_BASE (1U << 31) ///< Extent indices from here are in xal->shadow's pool
+
+/* A handle from xal_from_shm() on a region that has names and no extents */
+static inline bool
+xal_region_leased(const struct xal *xal)
+{
+	return xal->procrole == XAL_PROCROLE_SECONDARY &&
+	       xal->state->watch_mode == XAL_WATCHMODE_READ_LEASE;
+}
 
 int
 search_by_traversal(struct xal *xal, struct xal_inode *root, char *path, char *basepath, struct xal_inode **inode);

@@ -205,7 +205,10 @@ clock tick as the mapping; and an `O_DIRECT` write still in flight while the
 file is mapped, which the release's FIEMAP finds unless
 `xal_opts.lease_no_recheck` is set.
 
-It does not support `shm_name`. See `xal_extents_acquire()`,
+With `shm_name`, the published index has names and no extents. A reader of
+it attaches the files it opened with `xal_extents_attach_fd()` and takes
+their extents from `xal_extents_acquire()` under its own lease. Its
+`xal_get_extents()` fails with `-ENOTSUP`. See `xal_extents_acquire()`,
 `xal_extents_release()` and `xal_extents_attach_fd()` in `include/libxal.h`.
 
 #### File lookup modes

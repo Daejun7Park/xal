@@ -356,6 +356,7 @@ xal_be_fiemap_close(struct xal *xal)
 
 	if (xal->procrole == XAL_PROCROLE_SECONDARY) {
 		XAL_DEBUG("INFO: secondary; watcher and snapshot belong to the primary");
+		xal_be_fiemap_lease_shadow_close(xal);
 	} else {
 		// The watch thread is joined first: purging the clones unlinks paths the mountpoint
 		// watch reports on.
@@ -634,13 +635,7 @@ xal_be_fiemap_open(struct xal **xal, char *mountpoint, struct xal_opts *opts)
 
 	if (opts->watch_mode == XAL_WATCHMODE_READ_LEASE) {
 		// read-lease mode: no inotify watch; files are mapped on demand under a lease.
-		// Leases and reader counts are this process's; other processes have nothing to pin.
-		if (opts->shm_name) {
-			XAL_DEBUG("FAILED: XAL_WATCHMODE_READ_LEASE does not support shm_name");
-			err = -ENOTSUP;
-			goto failed;
-		}
-
+		// With shm_name the region has names only: a reader leases the files it attaches.
 		err = xal_be_fiemap_lease_init(cand, be->mountpoint, opts);
 		if (err) {
 			XAL_DEBUG("FAILED: xal_be_fiemap_lease_init(); err(%d)", err);
