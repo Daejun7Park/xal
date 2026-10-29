@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 SHM_NAME = "/xal_test_server"
+XAL_WATCHMODE_READ_LEASE = 3  # enum xal_watchmode
 
 
 def _artifacts(cijoe) -> Path:
@@ -51,8 +52,9 @@ def _wait_for(cijoe, cmd, want_ok, seconds):
     return False
 
 
-def _start_server(cijoe, dev_path, mountpoint, subtree=None):
-    """Start xal-server in XAL_WATCHMODE_NONE on the mount; return its pid once it published"""
+def _start_server(cijoe, dev_path, mountpoint, subtree=None, watchmode=0):
+    """Start xal-server on the mount, by default in XAL_WATCHMODE_NONE; return its pid once it
+    published"""
 
     art = _artifacts(cijoe)
     conf = art / "xal-server.conf"
@@ -64,7 +66,7 @@ def _start_server(cijoe, dev_path, mountpoint, subtree=None):
         "log_level = 3\n"
         f'devices = [ {{ uri = "{dev_path}", shm_name = "{SHM_NAME}", '
         f'mountpoint = "{mountpoint}"{sub} }} ]\n'
-        "\n[xal]\nwatchmode = 0\n"
+        f"\n[xal]\nwatchmode = {watchmode}\n"
     )
     cijoe.run(f"rm -f {pid_path} /dev/shm{SHM_NAME}_*")
     cijoe.run(
@@ -125,3 +127,46 @@ def test_none_retries_a_failed_reindex(cijoe):
     finally:
         _stop_server(cijoe, pid)
         cijoe.run(f"rm -rf {subtree} {subtree}.away")
+
+
+def test_read_lease_reindex_keeps_a_readers_write_lease(cijoe):
+    """In XAL_WATCHMODE_READ_LEASE, a reader attaches a file it opened for writing, which takes a
+    write lease, and marks the index dirty: the server's re-index breaks no lease, and the region
+    gives no extents but through the attached file."""
+
+    dev_path, mountpoint = _require_mount(cijoe)
+    path, path2 = f"{mountpoint}/xal_server_leased", f"{mountpoint}/xal_server_leased2"
+
+    for p, size in ((path, "1m"), (path2, "64k")):
+        err, _ = cijoe.run(f"rm -f {p} && xfs_io -f -c 'pwrite 0 {size}' -c fsync {p}")
+        assert not err
+    pid = _start_server(cijoe, dev_path, mountpoint, watchmode=XAL_WATCHMODE_READ_LEASE)
+    try:
+        err, _ = cijoe.run(
+            f"xal_test_lease_server {SHM_NAME} {path} 5000 {XAL_WATCHMODE_READ_LEASE} {path2}"
+        )
+        assert not err, (
+            "the re-index broke the reader's lease, the region gave extents, or a second attach "
+            "or xal_close() went wrong"
+        )
+    finally:
+        _stop_server(cijoe, pid)
+        cijoe.run(f"rm -f {path} {path2}")
+
+
+def test_none_refuses_an_attach(cijoe):
+    """In XAL_WATCHMODE_NONE, whose re-index opens every file and so breaks a lease, a reader's
+    attach is refused."""
+
+    dev_path, mountpoint = _require_mount(cijoe)
+    path = f"{mountpoint}/xal_server_none_attach"
+
+    err, _ = cijoe.run(f"rm -f {path} && xfs_io -f -c 'pwrite 0 64k' -c fsync {path}")
+    assert not err
+    pid = _start_server(cijoe, dev_path, mountpoint)
+    try:
+        err, _ = cijoe.run(f"xal_test_lease_server {SHM_NAME} {path} 5000 0 {path}")
+        assert not err, "a reader of a NONE index could attach a file"
+    finally:
+        _stop_server(cijoe, pid)
+        cijoe.run(f"rm -f {path}")
