@@ -22,6 +22,7 @@
 #include <xal.h>
 #include <xal_be_fiemap.h>
 #include <xal_be_fiemap_lease.h>
+#include <xal_odf.h>
 #include <xal_pool.h>
 
 /** Extents per FIEMAP ioctl when xal_opts.lease_fiemap_batch is 0 */
@@ -33,10 +34,16 @@
 /** Taken off lease-break-time for the time a break takes to reach xal's thread */
 #define XAL_LEASE_EXPIRE_MARGIN_NS (250ULL * 1000 * 1000)
 
+/** Most files a handle from xal_from_shm() may have attached at once */
+#define XAL_SHADOW_FILES 65536
+
 static const struct timespec lease_nap = {.tv_sec = 0, .tv_nsec = 20 * 1000};
 
 /** Longest wait between looks at a file another thread maps, which writes its dirty data back */
 #define XAL_LEASE_NAP_MAX_NS (1000 * 1000)
+
+/** Guards opening a secondary's shadow and the inodes copied into it */
+static pthread_mutex_t lease_shadow_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t
 now_ns(void)
@@ -123,6 +130,7 @@ static unsigned lease_generation;
 static void
 lease_atfork_prepare(void)
 {
+	pthread_mutex_lock(&lease_shadow_lock);
 	pthread_mutex_lock(&lease_proc.lifecycle);
 	pthread_mutex_lock(&lease_proc.lock);
 	/* So that a child finds no held[] or close queue being changed */
@@ -145,6 +153,7 @@ lease_atfork_parent(void)
 	lease_atfork_unlock_sets();
 	pthread_mutex_unlock(&lease_proc.lock);
 	pthread_mutex_unlock(&lease_proc.lifecycle);
+	pthread_mutex_unlock(&lease_shadow_lock);
 }
 
 static void
@@ -175,6 +184,7 @@ lease_atfork_child(void)
 	atomic_store(&lease_proc.tid, 0);
 	pthread_mutex_unlock(&lease_proc.lock);
 	pthread_mutex_unlock(&lease_proc.lifecycle);
+	pthread_mutex_unlock(&lease_shadow_lock);
 }
 
 static void
@@ -703,6 +713,55 @@ lease_open_path(struct xal_lease_set *ls, struct xal_inode *inode)
 	}
 }
 
+/* Keep a shadow's extent region no file holds, for the next file that fits; with ls->lock */
+static void
+lease_spare_put(struct xal_lease_set *ls, uint32_t extent_idx, uint32_t cap)
+{
+	if (ls->nspare == ls->spare_cap) {
+		uint32_t grown_cap = ls->spare_cap ? ls->spare_cap * 2 : 64;
+		struct xal_lease_region *grown = realloc(ls->spare, grown_cap * sizeof(*grown));
+
+		/* Lost to the pool until xal_close(), as a region replaced by a larger one is */
+		if (!grown) {
+			return;
+		}
+		ls->spare = grown;
+		ls->spare_cap = grown_cap;
+	}
+	ls->spare[ls->nspare].extent_idx = extent_idx;
+	ls->spare[ls->nspare].cap = cap;
+	ls->nspare++;
+}
+
+/*
+ * A spare region of exactly cap extents, or with !exact the smallest larger one, taken out; with
+ * ls->lock. Exact while the pool has room: a small file holding a larger region would leave the
+ * large file it came from to claim another.
+ */
+static bool
+lease_spare_take(struct xal_lease_set *ls, uint32_t cap, bool exact, struct xal_lease_region *out)
+{
+	uint32_t best = UINT32_MAX;
+
+	for (uint32_t i = 0; i < ls->nspare; ++i) {
+		if (ls->spare[i].cap == cap) {
+			best = i;
+			break;
+		}
+		if (!exact && ls->spare[i].cap > cap &&
+		    (best == UINT32_MAX || ls->spare[i].cap < ls->spare[best].cap)) {
+			best = i;
+		}
+	}
+	if (best == UINT32_MAX) {
+		return false;
+	}
+	*out = ls->spare[best];
+	ls->spare[best] = ls->spare[--ls->nspare];
+
+	return true;
+}
+
 /*
  * Called with the entry in MAPPING, which keeps other callers off it and readers off its extents.
  * Takes ls->lock only to publish, so a slow writeback holds up no lease break.
@@ -721,6 +780,9 @@ lease_and_map(struct xal_lease_set *ls, struct xal_inode *inode, uint32_t idx)
 
 	if (attached) {
 		fd = e->ufd;
+	} else if (atomic_load(&ls->xal->shadow)) {
+		/* A shadow's inodes have no path; it maps only the files attached to it */
+		return -ENOLCK;
 	} else {
 		e->ltype = F_RDLCK;
 		fd = lease_open_path(ls, inode);
@@ -796,14 +858,37 @@ lease_and_map(struct xal_lease_set *ls, struct xal_inode *inode, uint32_t idx)
 	if (vec.n > e->extent_cap) {
 		uint32_t cap = 1;
 
+		bool shadow = atomic_load(&ls->xal->shadow), spared;
+		struct xal_lease_region spare;
+
 		/* Rounded up, as a file mapped again after an eviction may have grown */
 		while (cap < vec.n) {
 			cap <<= 1;
 		}
-		err = xal_pool_claim_extents(&ls->xal->extents, cap, &extent_idx);
-		if (err) {
-			lease_unlock(ls);
-			goto failed_unlock;
+		/* A shadow's attaches come and go while it is open; reuse what they left */
+		spared = shadow && lease_spare_take(ls, cap, true, &spare);
+		if (!spared) {
+			err = xal_pool_claim_extents(&ls->xal->extents, cap, &extent_idx);
+			/* Out of pool, a larger spare holds the file rather than fail it */
+			if (err == -ENOMEM && shadow) {
+				spared = lease_spare_take(ls, cap, false, &spare);
+				err = spared ? 0 : err;
+			}
+			if (err && !spared) {
+				lease_unlock(ls);
+				goto failed_unlock;
+			}
+			/* Told from the region's extents by their index; see xal_extent_at() */
+			if (!spared && shadow) {
+				extent_idx += XAL_EXTENT_SHADOW_BASE;
+			}
+		}
+		if (spared) {
+			extent_idx = spare.extent_idx;
+			cap = spare.cap;
+		}
+		if (shadow && e->extent_cap) {
+			lease_spare_put(ls, inode->content.extents.extent_idx, e->extent_cap);
 		}
 		/* Together, so that a mapping failing below leaves the cap with its region */
 		inode->content.extents.extent_idx = extent_idx;
@@ -874,6 +959,28 @@ lease_set(struct xal *xal)
 	struct xal_be_fiemap *be = (struct xal_be_fiemap *)&xal->be;
 
 	return be->base.type == XAL_BACKEND_FIEMAP ? be->lease : NULL;
+}
+
+/*
+ * The shadow of a handle from xal_from_shm() when inode is one of the shadow's, as
+ * xal_extents_attach_fd() hands out there, so that a call runs on the shadow; otherwise xal. An
+ * inode of the region was not attached: it has the region's extents and no lease.
+ */
+static struct xal *
+lease_shadowed(struct xal *xal, const struct xal_inode *inode)
+{
+	struct xal *sh = atomic_load_explicit(&xal->shadow, memory_order_acquire);
+	uintptr_t first, at = (uintptr_t)inode;
+
+	if (!sh || sh == xal) {
+		return xal;
+	}
+	first = (uintptr_t)sh->inodes.memory;
+	if (at < first || at >= first + sh->inodes.free * sizeof(struct xal_inode)) {
+		return xal;
+	}
+
+	return sh;
 }
 
 /* Count one reader out; the last reader of a REVOKING entry drops its lease */
@@ -1035,8 +1142,17 @@ xal_extents_acquire(struct xal *xal, struct xal_inode *inode, struct xal_extents
 	if (!xal || !inode || !extents || !xal_inode_is_file(inode)) {
 		return -EINVAL;
 	}
+	xal = lease_shadowed(xal, inode);
 
 	ls = lease_set(xal);
+	if (!ls && xal_region_leased(xal)) {
+		/* Not attached, and the region has no extents for it */
+		return -ENOLCK;
+	}
+	/* A region's primary: mapping opens the file, which breaks readers' write leases */
+	if (ls && xal->state) {
+		return -ENOTSUP;
+	}
 	if (!ls) {
 		*extents = &inode->content.extents;
 		return 0;
@@ -1107,6 +1223,7 @@ xal_extents_release(struct xal *xal, struct xal_inode *inode)
 	if (!xal || !inode) {
 		return -EINVAL;
 	}
+	xal = lease_shadowed(xal, inode);
 
 	ls = lease_set(xal);
 	if (!ls) {
@@ -1269,10 +1386,244 @@ lease_attach(struct xal *xal, struct xal_inode *inode, int fd)
 	return err;
 }
 
+/*
+ * Open the shadow of a handle from xal_from_shm(): a handle of this process's own, with an inode
+ * pool of XAL_SHADOW_FILES slots and an extent pool for the files attached to it. Called with
+ * lease_shadow_lock held.
+ */
+static int
+lease_shadow_open(struct xal *xal)
+{
+	struct xal_be_fiemap *be = (struct xal_be_fiemap *)&xal->be, *sbe;
+	struct xal_opts opts = {0};
+	struct xal_lease_set *ls;
+	struct xal *sh;
+	uint32_t first;
+	int err;
+
+	if (be->base.type != XAL_BACKEND_FIEMAP || !xal->state) {
+		return -EINVAL;
+	}
+
+	sh = calloc(1, sizeof(*sh));
+	if (!sh) {
+		return -ENOMEM;
+	}
+	sh->root_idx = XAL_POOL_IDX_NONE;
+	sh->index_state = &sh->_index_state_storage;
+	sh->seq_lock = &sh->_seq_lock_storage;
+	sh->sb = xal->sb;
+	atomic_init(&sh->shadow, sh);
+	sbe = (struct xal_be_fiemap *)&sh->be;
+	sbe->base.type = XAL_BACKEND_FIEMAP;
+	err = xal_pool_map(&sh->inodes, XAL_SHADOW_FILES, XAL_SHADOW_FILES,
+			   sizeof(struct xal_inode), NULL);
+	if (!err) {
+		err = xal_pool_claim_inodes(&sh->inodes, XAL_SHADOW_FILES, &first);
+	}
+	if (!err) {
+		err = xal_pool_map(&sh->extents, 40000000UL, 4096, sizeof(struct xal_extent), NULL);
+	}
+	if (!err) {
+		/* The region's st_dev: the server's mountpoint may not exist in this namespace */
+		err = xal_be_fiemap_lease_init(sh, (dev_t)xal->st_dev, &opts);
+	}
+	if (!err) {
+		err = xal_be_fiemap_lease_prepare(sh);
+	}
+	if (err) {
+		goto failed;
+	}
+	ls = sbe->lease;
+	ls->ino_map = kh_init(ino_to_idx);
+	ls->free_slots = calloc(XAL_SHADOW_FILES, sizeof(*ls->free_slots));
+	if (!ls->ino_map || !ls->free_slots) {
+		err = -ENOMEM;
+		goto failed;
+	}
+
+	atomic_store_explicit(&xal->shadow, sh, memory_order_release);
+
+	return 0;
+
+failed:
+	xal_be_fiemap_lease_close(sh);
+	xal_pool_unmap(&sh->inodes, false);
+	xal_pool_unmap(&sh->extents, false);
+	free(sh);
+
+	return err;
+}
+
+/*
+ * The shadow's inode for an open regular file, made from its fstat() the first time it is
+ * attached, when the shadow is also opened, and counted as being attached until
+ * lease_shadow_put(). Called with lease_shadow_lock held.
+ */
+static int
+lease_shadow_inode(struct xal *xal, const struct stat *st, struct xal_inode **out)
+{
+	struct xal_lease_set *ls;
+	struct xal_inode *si;
+	struct xal *sh;
+	uint32_t idx;
+	khiter_t it;
+	int ret, err;
+
+	if (!atomic_load(&xal->shadow)) {
+		err = lease_shadow_open(xal);
+		if (err) {
+			return err;
+		}
+	}
+	sh = atomic_load(&xal->shadow);
+	ls = lease_set(sh);
+	if (lease_foreign(ls)) {
+		return -ECHILD;
+	}
+
+	it = kh_get(ino_to_idx, ls->ino_map, st->st_ino);
+	if (it != kh_end(ls->ino_map)) {
+		idx = kh_val(ls->ino_map, it);
+		ls->entries[idx].attaching++;
+		*out = xal_inode_at(sh, idx);
+		return 0;
+	}
+	if (!ls->nfree && ls->nshadow == ls->nentries) {
+		return -ENOSPC;
+	}
+	it = kh_put(ino_to_idx, ls->ino_map, st->st_ino, &ret);
+	if (ret < 0) {
+		return -ENOMEM;
+	}
+	/* Unused slots first, then the one detached longest ago: a stale copy of a detached file
+	 * stays -ENOLCK for as long as it can before its slot names another file */
+	if (ls->nshadow < ls->nentries) {
+		idx = ls->nshadow++;
+	} else {
+		idx = ls->free_slots[ls->free_head];
+		ls->free_head = (ls->free_head + 1) % XAL_SHADOW_FILES;
+		ls->nfree--;
+	}
+	kh_val(ls->ino_map, it) = idx;
+
+	/* Its region, if it had one, went to the spares when it was detached */
+	si = xal_inode_at(sh, idx);
+	si->content.extents.extent_idx = XAL_EXTENT_SHADOW_BASE;
+	si->content.extents.count = 0;
+	si->ino = st->st_ino;
+	si->size = st->st_size;
+	si->ftype = XAL_ODF_DIR3_FT_REG_FILE;
+	si->namelen = 0;
+	si->name[0] = '\0';
+	si->parent_idx = XAL_POOL_IDX_NONE;
+	ls->entries[idx].attaching++;
+	*out = si;
+
+	return 0;
+}
+
+/*
+ * End an attach of a shadow inode, when attaching is set, and hand the inode back for another
+ * file once no attach is under way and the file is neither attached nor read
+ */
+static void
+lease_shadow_put(struct xal *sh, struct xal_inode *si, bool attaching)
+{
+	struct xal_lease_set *ls = lease_set(sh);
+	uint32_t idx = xal_inode_idx(sh, si);
+	struct xal_lease_entry *e = &ls->entries[idx];
+	bool unused;
+	khiter_t it;
+
+	pthread_mutex_lock(&lease_shadow_lock);
+	if (attaching) {
+		e->attaching--;
+	}
+	pthread_mutex_lock(&ls->lock);
+	unused = !e->attaching && e->ufd < 0;
+	lease_unlock(ls);
+	it = kh_get(ino_to_idx, ls->ino_map, si->ino);
+	if (unused && it != kh_end(ls->ino_map) && kh_val(ls->ino_map, it) == idx) {
+		kh_del(ino_to_idx, ls->ino_map, it);
+		ls->free_slots[(ls->free_head + ls->nfree) % XAL_SHADOW_FILES] = idx;
+		ls->nfree++;
+
+		/* The slot waits in the ring; its region goes to the next file that fits */
+		pthread_mutex_lock(&ls->lock);
+		if (e->extent_cap) {
+			lease_spare_put(ls, si->content.extents.extent_idx, e->extent_cap);
+			e->extent_cap = 0;
+		}
+		si->content.extents.extent_idx = XAL_EXTENT_SHADOW_BASE;
+		si->content.extents.count = 0;
+		lease_unlock(ls);
+	}
+	pthread_mutex_unlock(&lease_shadow_lock);
+}
+
+/* xal_extents_attach_fd() on a handle from xal_from_shm(), attaching the file to its shadow */
+static int
+lease_shadow_attach(struct xal *xal, struct xal_inode *inode, int fd, struct xal_inode **attached)
+{
+	struct xal_inode *si;
+	struct stat st;
+	struct xal *sh;
+	int err;
+
+	/* The region has no inodes to pass */
+	if (!attached || fd < 0 || inode) {
+		return -EINVAL;
+	}
+	if (fstat(fd, &st)) {
+		return -errno;
+	}
+	if (!S_ISREG(st.st_mode)) {
+		return -EINVAL;
+	}
+	/* Extents of a file on another filesystem address another device */
+	if (st.st_dev != xal->st_dev) {
+		return -EXDEV;
+	}
+
+	pthread_mutex_lock(&lease_shadow_lock);
+	err = lease_shadow_inode(xal, &st, &si);
+	pthread_mutex_unlock(&lease_shadow_lock);
+	if (err) {
+		return err;
+	}
+	sh = atomic_load(&xal->shadow);
+
+	err = lease_attach(sh, si, fd);
+	if (!err) {
+		*attached = si;
+	}
+	lease_shadow_put(sh, si, true);
+
+	return err;
+}
+
 int
 xal_extents_attach_fd(struct xal *xal, struct xal_inode *inode, int fd, struct xal_inode **attached)
 {
 	int err;
+
+	if (xal && xal->procrole == XAL_PROCROLE_SECONDARY) {
+		/* The re-index of other modes opens every file, which breaks the lease */
+		if (!xal_region_leased(xal)) {
+			return -EINVAL;
+		}
+		/* Before lease_shadow_lock is first taken, so a fork never copies it held */
+		pthread_once(&lease_atfork_once, lease_atfork_register);
+		if (lease_atfork_err) {
+			return -lease_atfork_err;
+		}
+		return lease_shadow_attach(xal, inode, fd, attached);
+	}
+	/* The region has no inodes to attach to; its readers attach to their own handles */
+	if (xal && xal->state && lease_set(xal)) {
+		return -ENOTSUP;
+	}
 
 	err = lease_attach(xal, inode, fd);
 	if (!err && attached) {
@@ -1285,10 +1636,16 @@ xal_extents_attach_fd(struct xal *xal, struct xal_inode *inode, int fd, struct x
 int
 xal_extents_detach_fd(struct xal *xal, struct xal_inode *inode)
 {
+	struct xal *region = xal;
 	struct xal_lease_entry *e;
 	struct xal_lease_set *ls;
-	uint32_t idx;
 	int state, err;
+	uint32_t idx;
+
+	if (!xal || !inode) {
+		return -EINVAL;
+	}
+	xal = lease_shadowed(xal, inode);
 
 	e = lease_entry(xal, inode, &ls, &idx, &err);
 	if (!e) {
@@ -1305,6 +1662,10 @@ xal_extents_detach_fd(struct xal *xal, struct xal_inode *inode)
 	}
 	lease_unlock(ls);
 
+	if (!err && xal != region) {
+		lease_shadow_put(xal, inode, false);
+	}
+
 	return err;
 }
 
@@ -1312,12 +1673,14 @@ int
 xal_lease_stats(struct xal *xal, struct xal_lease_stats *stats)
 {
 	struct xal_lease_set *ls;
+	struct xal *sh;
 
 	if (!xal || !stats) {
 		return -EINVAL;
 	}
 
-	ls = lease_set(xal);
+	sh = atomic_load_explicit(&xal->shadow, memory_order_acquire);
+	ls = lease_set(sh ? sh : xal);
 	if (!ls) {
 		return -EINVAL;
 	}
@@ -1383,6 +1746,7 @@ xal_be_fiemap_lease_reset(struct xal *xal, bool force)
 		atomic_store(&e->state, XAL_LEASE_UNMAPPED);
 		e->extent_cap = 0;
 	}
+	ls->nspare = 0;
 	kh_clear(fd_to_idx, ls->fd_map);
 	kh_clear(fd_to_idx, ls->ufd_map);
 	lease_unlock(ls);
@@ -1397,7 +1761,8 @@ xal_be_fiemap_lease_prepare(struct xal *xal)
 	struct xal_lease_entry *entries;
 	size_t n;
 
-	if (!ls) {
+	/* A region's primary refuses acquire and attach, so it needs no entries */
+	if (!ls || xal->state) {
 		return 0;
 	}
 
@@ -1422,12 +1787,11 @@ xal_be_fiemap_lease_prepare(struct xal *xal)
 }
 
 int
-xal_be_fiemap_lease_init(struct xal *xal, const char *mountpoint, const struct xal_opts *opts)
+xal_be_fiemap_lease_init(struct xal *xal, dev_t st_dev, const struct xal_opts *opts)
 {
 	struct xal_be_fiemap *be = (struct xal_be_fiemap *)&xal->be;
 	struct xal_lease_set *ls;
 	struct rlimit rl;
-	struct stat st;
 	int err;
 
 	/* FIEMAP refuses more, see FIEMAP_MAX_EXTENTS in the kernel's fs/ioctl.c */
@@ -1436,16 +1800,13 @@ xal_be_fiemap_lease_init(struct xal *xal, const char *mountpoint, const struct x
 			  opts->lease_fiemap_batch);
 		return -EINVAL;
 	}
-	if (stat(mountpoint, &st)) {
-		return -errno;
-	}
 
 	ls = calloc(1, sizeof(*ls));
 	if (!ls) {
 		return -ENOMEM;
 	}
 	ls->xal = xal;
-	ls->dev = st.st_dev;
+	ls->dev = st_dev;
 	ls->generation = lease_generation;
 	ls->recheck = !opts->lease_no_recheck;
 	ls->fiemap_batch = opts->lease_fiemap_batch ? opts->lease_fiemap_batch : XAL_FIEMAP_BATCH;
@@ -1507,10 +1868,31 @@ xal_be_fiemap_lease_close(struct xal *xal)
 
 	kh_destroy(fd_to_idx, ls->fd_map);
 	kh_destroy(fd_to_idx, ls->ufd_map);
+	if (ls->ino_map) {
+		kh_destroy(ino_to_idx, ls->ino_map);
+	}
+	free(ls->free_slots);
+	free(ls->spare);
 	free(ls->entries);
 	free(ls->held);
 	free(ls->attached);
 	pthread_mutex_destroy(&ls->lock);
 	free(ls);
 	be->lease = NULL;
+}
+
+void
+xal_be_fiemap_lease_shadow_close(struct xal *xal)
+{
+	struct xal *sh = atomic_load(&xal->shadow);
+
+	if (!sh || sh == xal) {
+		return;
+	}
+
+	atomic_store(&xal->shadow, NULL);
+	xal_be_fiemap_lease_close(sh);
+	xal_pool_unmap(&sh->inodes, false);
+	xal_pool_unmap(&sh->extents, false);
+	free(sh);
 }

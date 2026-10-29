@@ -51,7 +51,9 @@
  * --probe acquires once, prints ACQUIRE err=<err> and, on success, one line per extent:
  *   EXTENT <i> byte=<device byte offset> bytes=<length> flag=<flag>
  * then releases twice, printing RELEASE err=<err> and RELEASE_AGAIN err=<err>, and exits. --shm
- * opens with a shm_name, prints OPEN err=<err> and exits. --fork acquires and releases, forks a
+ * opens with a shm_name and prints OPEN err=<err>, indexes, attaches <file>'s descriptor and
+ * prints ATTACH err=<err>, then opens again with the mountpoint as subtree, prints
+ * SUBTREE err=<err> and exits. --fork acquires and releases, forks a
  * child that acquires, prints CHILD_ACQUIRE err=<err> and CHILD_STATS err=<what xal_lease_stats()
  * returned>, opens /dev/null 64 times, closes the handle and prints CHILD_FDS=<how many of those
  * are still open>/<how many it opened>, then prints PARENT_LEASE=<n>, the number of leases on
@@ -588,6 +590,25 @@ main(int argc, char *argv[])
 	err = xal_open_from_uri(argv[0], &xal, &opts);
 	if (mode == 's') {
 		printf("OPEN err=%d\n", err);
+		if (!err) {
+			struct xal_inode *attached;
+			int fd = open(argv[2], O_RDONLY | O_CLOEXEC);
+
+			err = fd < 0 ? -errno : xal_index(xal);
+			if (!err) {
+				err = xal_extents_attach_fd(xal, NULL, fd, &attached);
+			}
+			printf("ATTACH err=%d\n", err);
+			/* Closing the handle first drops an attachment that should not have been
+			 * made */
+			xal_close(xal);
+			if (fd >= 0) {
+				close(fd);
+			}
+		}
+		opts.subtree = argv[1];
+		err = xal_open_from_uri(argv[0], &xal, &opts);
+		printf("SUBTREE err=%d\n", err);
 		if (!err) {
 			xal_close(xal);
 		}

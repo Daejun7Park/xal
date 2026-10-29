@@ -45,9 +45,16 @@ struct xal_lease_entry {
 	int ufd; ///< The caller's descriptor from xal_extents_attach_fd(), never closed; -1 if none
 	int ltype;	       ///< F_RDLCK, or F_WRLCK on a caller's descriptor open for writing
 	struct timespec ctime; ///< The file's ctime once the lease was taken, for a write lease
+	uint32_t attaching; ///< In a shadow: attaches of the file under way; lease_shadow_lock
+};
+
+struct xal_lease_region {
+	uint32_t extent_idx; ///< As in inode->content.extents.extent_idx
+	uint32_t cap;
 };
 
 KHASH_MAP_INIT_INT(fd_to_idx, uint32_t)
+KHASH_MAP_INIT_INT64(ino_to_idx, uint32_t)
 
 struct xal_lease_set {
 	struct xal *xal;
@@ -73,10 +80,18 @@ struct xal_lease_set {
 	struct xal_lease_set *next; ///< In the process-wide list of sets
 	uint32_t fiemap_batch;	    ///< xal_opts.lease_fiemap_batch, or XAL_FIEMAP_BATCH for 0
 	bool recheck;		    ///< !xal_opts.lease_no_recheck
+	kh_ino_to_idx_t *ino_map;   ///< In a shadow: inode number to the inode copied for it
+	uint32_t nshadow;	    ///< In a shadow: inodes handed out, from the first
+	uint32_t *free_slots; ///< In a shadow: inodes of detached files, a ring from free_head
+	uint32_t free_head;
+	uint32_t nfree;
+	struct xal_lease_region *spare; ///< In a shadow: extent regions no file holds
+	uint32_t nspare;
+	uint32_t spare_cap;
 };
 
 int
-xal_be_fiemap_lease_init(struct xal *xal, const char *mountpoint, const struct xal_opts *opts);
+xal_be_fiemap_lease_init(struct xal *xal, dev_t st_dev, const struct xal_opts *opts);
 
 /**
  * Release every lease and forget every mapping; for xal_index() before it clears the pools
@@ -94,5 +109,11 @@ xal_be_fiemap_lease_prepare(struct xal *xal);
 
 void
 xal_be_fiemap_lease_close(struct xal *xal);
+
+/**
+ * Release a secondary's attachments; for its xal_close()
+ */
+void
+xal_be_fiemap_lease_shadow_close(struct xal *xal);
 
 #endif /* XAL_BE_FIEMAP_LEASE_H */

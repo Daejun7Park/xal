@@ -8,6 +8,7 @@ hold the file's data, and that the file is mapped again afterwards. The helper r
 which gives it CAP_LEASE for files the test user owns.
 """
 
+import errno
 import os
 import re
 import time
@@ -27,7 +28,6 @@ SWEEP_RE = re.compile(
 XAL_EXTENT_SHARED = 0x2  # enum xal_extent_flag
 FMR_OWN_FREE = "special_0:1"
 EINVAL = 22
-ENOTSUP = 95
 ESTALE = 116
 EAGAIN = 11
 EBUSY = 16
@@ -705,13 +705,21 @@ def test_lease_release_stale_with_no_descriptor_to_drop(cijoe, lease_break_time)
     assert err == -ESTALE, f"release returned {err} with no descriptor to drop"
 
 
-def test_lease_rejects_shm(cijoe):
-    """Leases pin nothing for other processes, so a shared index is refused."""
+def test_lease_opens_with_shm(cijoe):
+    """A shared index opens in this mode, and its primary, which has no inodes, refuses an attach;
+    readers attach, see tests/test_server.py. A subtree is refused, as it would not scope them."""
 
     dev_path, mountpoint = _require_fixture(cijoe)
+    path = f"{mountpoint}/xal_lease_shm"
+    _fill(cijoe, path, "s", 4096)
 
-    out = _capture(cijoe, f"sudo xal_lease_hold {dev_path} {mountpoint} {mountpoint} --shm")
-    assert f"OPEN err=-{ENOTSUP}" in out, out
+    try:
+        out = _capture(cijoe, f"sudo xal_lease_hold {dev_path} {mountpoint} {path} --shm")
+    finally:
+        cijoe.run(f"rm -f {path}")
+    assert "OPEN err=0" in out, out
+    assert f"ATTACH err={-errno.ENOTSUP}" in out, out
+    assert f"SUBTREE err={-errno.EINVAL}" in out, out
 
 
 def test_lease_attach_writer_waits_for_reader(cijoe):

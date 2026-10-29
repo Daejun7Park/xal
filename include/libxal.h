@@ -78,13 +78,16 @@ enum xal_watchmode {
 	XAL_WATCHMODE_REFLINK_SNAPSHOT = 1,
 
 	/**
-	 * FIEMAP backend only; xal_open() refuses it for XAL_BACKEND_XFS and with
-	 * xal_opts.shm_name with -ENOTSUP. xal_index() builds the tree without extents;
-	 * xal_extents_acquire() maps a file on first use while holding a read lease on it
-	 * (F_SETLEASE, F_RDLCK), so that a writer's open() or truncate() of the file waits until
-	 * the callers between xal_extents_acquire() and xal_extents_release() are done. While a
-	 * handle in this mode is open, a thread of xal's takes SIGRTMIN+7 and SIGIO; see README.md.
-	 * Not 2, which configs written for the removed extent-update mode still name.
+	 * FIEMAP backend only; xal_open() refuses it for XAL_BACKEND_XFS with -ENOTSUP. xal_index()
+	 * builds the tree without extents; xal_extents_acquire() maps a file on first use while
+	 * holding a read lease on it (F_SETLEASE, F_RDLCK), so that a writer's open() or truncate()
+	 * of the file waits until the callers between xal_extents_acquire() and
+	 * xal_extents_release() are done. With xal_opts.shm_name the region has no names or
+	 * extents, and xal_index() opens and walks nothing: readers attach the files they opened,
+	 * see xal_extents_attach_fd(), and find the region of a file by xal_get_st_dev();
+	 * xal_opts.subtree cannot be set with it. While a handle in this mode is open, a thread of
+	 * xal's takes SIGRTMIN+7 and SIGIO; see README.md. Not 2, which configs written for the
+	 * removed extent-update mode still name.
 	 */
 	XAL_WATCHMODE_READ_LEASE = 3,
 };
@@ -105,7 +108,8 @@ struct xal_opts {
 
 	/** FIEMAP backend only: absolute path at or under the mountpoint to scope the index to.
 	 *  Only files beneath it are indexed, and in XAL_WATCHMODE_REFLINK_SNAPSHOT only those
-	 *  are reflinked. NULL or empty indexes the whole mount. Ignored by the XFS backend. */
+	 *  are reflinked. NULL or empty indexes the whole mount. Ignored by the XFS backend.
+	 *  Refused with shm_name in XAL_WATCHMODE_READ_LEASE, whose region has no names. */
 	const char *subtree;
 
 	/** XAL_WATCHMODE_READ_LEASE only: if non-zero, xal_extents_release() does not map the file
@@ -191,7 +195,7 @@ struct xal_dentries {
 };
 
 struct xal_extents {
-	uint32_t extent_idx; ///< Index of first extent in xal->extents pool
+	uint32_t extent_idx; ///< Index of the first extent, to read through xal_extent_at()
 	uint32_t count;      ///< Number of extents
 };
 
@@ -347,6 +351,19 @@ xal_get_sb(struct xal *xal);
 
 uint32_t
 xal_get_sb_blocksize(struct xal *xal);
+
+/**
+ * The st_dev of the mountpoint of a FIEMAP handle when it was opened, as stat() gives it for the
+ * files of the filesystem mounted there
+ *
+ * A reader with a descriptor compares this with the descriptor's st_dev to find the region that
+ * serves the file; a region in XAL_WATCHMODE_READ_LEASE has no names to look the file up by.
+ *
+ * @return On success, 0. -ENODEV when the handle maps no mounted filesystem, as with
+ * XAL_BACKEND_XFS; -EINVAL when xal or st_dev is NULL.
+ */
+int
+xal_get_st_dev(struct xal *xal, dev_t *st_dev);
 
 typedef int (*xal_walk_cb)(struct xal *xal, struct xal_inode *inode, void *cb_args, int level);
 
@@ -555,14 +572,15 @@ uint64_t
 xal_fsbno_offset(struct xal *xal, uint64_t fsbno);
 
 /**
- * Construct a read-only xal from shared memory created by a primary process.
+ * Construct a xal from shared memory created by a primary process.
  *
  * Intended for multi-process support, where a primary process has built the xal tree with
  * opts->shm_name set and called xal_index(). All metadata (superblock, backend type, mountpoint,
  * the subtree a scoped index is rooted at, root index) is read from the shared state region; no
  * out-of-band communication is required.
  * The resulting xal can be closed with xal_close(), which will free the struct xal allocation and
- * munmap the shared memory regions.
+ * munmap the shared memory regions. It only reads the pools; the files it attaches with
+ * xal_extents_attach_fd() are mapped in memory of its own.
  *
  * Calling xal_get_inode(), xal_get_extents() or xal_get_dentries() on the returned xal struct
  * will always result in it using the XAL_FILE_LOOKUPMODE_TRAVERSE. To get constant time lookups
@@ -653,7 +671,9 @@ xal_inode_is_file(struct xal_inode *inode);
 			   be given as if it was mounted at root ("/").
  * @param inode Pointer for the found inode
  *
- * @returns On success, 0 is returned. On error, negative errno is returned to indicate the error.
+ * @returns On success, 0 is returned. On error, negative errno is returned to indicate the error;
+ * -ENOTSUP on a handle from xal_from_shm() of a region published in XAL_WATCHMODE_READ_LEASE,
+ * which has no names.
  */
 int
 xal_get_inode(struct xal *xal, char *path, struct xal_inode **inode);
@@ -708,7 +728,9 @@ xal_build_lookup_hashmap(struct xal *xal);
 			   be given as if it was mounted at root ("/").
  * @param extents Pointer for the found xal_extents
  * 
- * @returns On success, 0 is returned. On error, negative errno is returned to indicate the error.
+ * @returns On success, 0 is returned. On error, negative errno is returned to indicate the error;
+ * -ENOTSUP on a handle from xal_from_shm() of a region published in XAL_WATCHMODE_READ_LEASE,
+ * which has no names or extents.
  */
 int
 xal_get_extents(struct xal *xal, char *path, struct xal_extents **extents);
@@ -735,14 +757,20 @@ xal_get_extents(struct xal *xal, char *path, struct xal_extents **extents);
  * xal_close() on the same handle, and xal_index() fails with -EBUSY while extents are held. The
  * leases belong to the process that opened the handle.
  *
- * @param xal The xal struct obtained when opened with xal_open() or xal_open_from_uri()
+ * With xal_opts.shm_name the region has no names. A reader of it attaches its files with
+ * xal_extents_attach_fd(); the primary has no inodes to acquire or attach.
+ *
+ * @param xal The xal struct obtained when opened with xal_open() or xal_open_from_uri(), or one
+ *        from xal_from_shm() for a file attached to it
  * @param inode A regular file in the index
  * @param extents Set to the file's extents on success
  *
  * @return On success, 0. -EAGAIN when the lease cannot be taken (the file is open for writing, or,
  * for a write lease, open elsewhere at all) or is being recalled, -ESTALE when the indexed path no
  * longer leads to the indexed file, -EMFILE when xal is out of descriptors and every file holding
- * one has readers, -ECHILD in a forked child, other negative errno on error.
+ * one has readers, -ENOLCK on a handle from xal_from_shm() of a read-lease region for a file not
+ * attached to it or detached since, until its slot is reused, -ENOTSUP on the primary of such a
+ * region, -ECHILD in a forked child, other negative errno on error.
  */
 int
 xal_extents_acquire(struct xal *xal, struct xal_inode *inode, struct xal_extents **extents);
@@ -765,7 +793,8 @@ xal_extents_acquire(struct xal *xal, struct xal_inode *inode, struct xal_extents
  * after the kernel issued it, with lease-break-time as last read, 45 s if never. In other watch
  * modes this does nothing.
  *
- * @param xal The xal struct obtained when opened with xal_open() or xal_open_from_uri()
+ * @param xal The xal struct obtained when opened with xal_open() or xal_open_from_uri(), or one
+ *        from xal_from_shm() for a file attached to it
  * @param inode The inode passed to xal_extents_acquire()
  *
  * @return On success, 0. -ESTALE when the data read through the extents may not be the file's,
@@ -779,12 +808,12 @@ xal_extents_release(struct xal *xal, struct xal_inode *inode);
 /**
  * Hold a file's lease on the caller's descriptor of it, and map the file now
  *
- * XAL_WATCHMODE_READ_LEASE only. For a caller that opens its files and registers them before
- * reading, as cuFile-like callers do: the open(), F_SETLEASE and first FIEMAP leave the first
- * xal_extents_acquire(). xal takes a read lease when fd is open read-only and a write lease
- * otherwise, takes over fd's F_SETSIG and owner for the break, takes the lease again on fd after a
- * break, and never closes fd. xal_index() and xal_close() release every attachment and leave the
- * descriptors open.
+ * XAL_WATCHMODE_READ_LEASE, or a handle from xal_from_shm() of a region in that mode. For a caller
+ * that opens its files and registers them before reading, as cuFile-like callers do: the open(),
+ * F_SETLEASE and first FIEMAP leave the first xal_extents_acquire(). xal takes a read lease when
+ * fd is open read-only and a write lease otherwise, takes over fd's F_SETSIG and owner for the
+ * break, takes the lease again on fd after a break, and never closes fd. xal_index() and
+ * xal_close() release every attachment and leave the descriptors open.
  *
  * fd must stay open, and name that file, until xal_extents_detach_fd(), xal_index() or
  * xal_close(), and its open file may be attached once. A write lease breaks on any other open() of
@@ -792,16 +821,32 @@ xal_extents_release(struct xal *xal, struct xal_inode *inode);
  * nothing; the next xal_extents_release() returns -ESTALE when the file's size or ctime changed.
  * README.md has the details.
  *
- * @param xal The xal struct obtained when opened with xal_open() or xal_open_from_uri()
- * @param inode A regular file in the index
+ * On a handle from xal_from_shm(), the file is attached to a handle private to this process, which
+ * holds a copy of its inode and its extents, and *attached is that copy. Pass it to the other
+ * xal_extents_*() calls; it stays valid until detached or xal_close(), however often the region is
+ * indexed again, and xal_opts.lease_no_recheck cannot be set for it. A detached copy is not kept:
+ * once all 65536 slots have been used, its slot goes to another file, and every call through the
+ * copy then acts on that file. Up to 65536 files can be attached there at once. The first attach
+ * starts xal's lease thread in this process, which takes SIGRTMIN+7 and SIGIO until xal_close(),
+ * and a lease needs the file's owner or CAP_LEASE.
+ *
+ * @param xal The xal struct obtained when opened with xal_open(), xal_open_from_uri() or
+ *        xal_from_shm()
+ * @param inode A regular file in the index; NULL on a handle from xal_from_shm(), whose region
+ *        has no inodes
  * @param fd The caller's descriptor of that file
- * @param attached Set to the inode to pass for the attached file afterwards, which is inode; may be
- *        NULL
+ * @param attached Set to the inode to pass for the attached file afterwards: inode, or the copy on
+ *        a handle from xal_from_shm(), where it is required. May be NULL otherwise.
  *
  * @return On success, 0. -EAGAIN when the lease cannot be taken now, where a retry may succeed;
  * -EBUSY when the file has readers, is being mapped, dropped or revoked, or is attached, or fd is
- * attached already; -EINVAL when the handle is not in XAL_WATCHMODE_READ_LEASE or fd is not the
- * file's; -ECHILD in a forked child; other negative errno as xal_extents_acquire().
+ * attached already; -EINVAL when the handle is not in XAL_WATCHMODE_READ_LEASE, or is from
+ * xal_from_shm() on a region published in another mode, or fd is not the file's; -ENOTSUP on the
+ * primary of a region published with xal_opts.shm_name; -EXDEV when fd is on another filesystem
+ * than the region's; -ENOSPC when 65536 files are attached; -EACCES when the caller neither owns
+ * the file nor has CAP_LEASE; -ECHILD in a forked child; other negative errno as
+ * xal_extents_acquire(), -ENOMEM among them when the extent pool is used up and no region a
+ * detached file left is large enough.
  */
 int
 xal_extents_attach_fd(struct xal *xal, struct xal_inode *inode, int fd,
@@ -827,7 +872,8 @@ struct xal_lease_stats {
 };
 
 /**
- * Counters of XAL_WATCHMODE_READ_LEASE; -EINVAL in other watch modes
+ * Counters of XAL_WATCHMODE_READ_LEASE, or of the files attached to a handle from xal_from_shm();
+ * -EINVAL in other watch modes, and on such a handle before its first attach
  */
 int
 xal_lease_stats(struct xal *xal, struct xal_lease_stats *stats);
@@ -843,7 +889,8 @@ xal_lease_stats(struct xal *xal, struct xal_lease_stats *stats);
 			   be given as if it was mounted at root ("/").
  * @param dentries Pointer for the found xal_dentries
  * 
- * @returns On success, 0 is returned. On error, negative errno is returned to indicate the error.
+ * @returns On success, 0 is returned. On error, negative errno is returned to indicate the error;
+ * -ENOTSUP as xal_get_inode().
  */
 int
 xal_get_dentries(struct xal *xal, char *path, struct xal_dentries **dentries);

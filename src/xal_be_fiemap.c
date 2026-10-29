@@ -356,6 +356,7 @@ xal_be_fiemap_close(struct xal *xal)
 
 	if (xal->procrole == XAL_PROCROLE_SECONDARY) {
 		XAL_DEBUG("INFO: secondary; watcher and snapshot belong to the primary");
+		xal_be_fiemap_lease_shadow_close(xal);
 	} else {
 		// The watch thread is joined first: purging the clones unlinks paths the mountpoint
 		// watch reports on.
@@ -634,14 +635,14 @@ xal_be_fiemap_open(struct xal **xal, char *mountpoint, struct xal_opts *opts)
 
 	if (opts->watch_mode == XAL_WATCHMODE_READ_LEASE) {
 		// read-lease mode: no inotify watch; files are mapped on demand under a lease.
-		// Leases and reader counts are this process's; other processes have nothing to pin.
-		if (opts->shm_name) {
-			XAL_DEBUG("FAILED: XAL_WATCHMODE_READ_LEASE does not support shm_name");
-			err = -ENOTSUP;
+		// With shm_name the region has no names: a reader leases the files it attaches.
+		// A subtree would not scope what a reader attaches.
+		if (opts->shm_name && be->subtree) {
+			XAL_DEBUG("FAILED: a read-lease region cannot be scoped to a subtree");
+			err = -EINVAL;
 			goto failed;
 		}
-
-		err = xal_be_fiemap_lease_init(cand, be->mountpoint, opts);
+		err = xal_be_fiemap_lease_init(cand, sb.st_dev, opts);
 		if (err) {
 			XAL_DEBUG("FAILED: xal_be_fiemap_lease_init(); err(%d)", err);
 			goto failed;
@@ -696,7 +697,12 @@ xal_be_fiemap_open(struct xal **xal, char *mountpoint, struct xal_opts *opts)
 
 	// Scope the pre-count to the subtree when set: the index walks only that subtree
 	// (see xal_be_fiemap_index), so counting from the mountpoint would over-reserve the inode pool.
-	nallocated = retrieve_total_entries(be->subtree ? be->subtree : be->mountpoint);
+	// A read-lease region holds the root alone.
+	if ((opts->watch_mode == XAL_WATCHMODE_READ_LEASE) && opts->shm_name) {
+		nallocated = 1;
+	} else {
+		nallocated = retrieve_total_entries(be->subtree ? be->subtree : be->mountpoint);
+	}
 	if (nallocated < 0) {
 		XAL_DEBUG("Failed: retrieve_total_entries()");
 		err = nallocated;
@@ -713,6 +719,7 @@ xal_be_fiemap_open(struct xal **xal, char *mountpoint, struct xal_opts *opts)
 
 	cand->sb.blocksize = fs.f_bsize;
 	cand->sb.rootino = sb.st_ino;
+	cand->st_dev = sb.st_dev;
 
 	if (opts->shm_name) {
 		if (strlen(opts->shm_name) > XAL_PATH_MAXLEN) {
@@ -1319,10 +1326,14 @@ xal_be_fiemap_index(struct xal *xal)
 	// (see there).
 	char *walk_root = be->subtree ? be->subtree : be->mountpoint;
 
-	err = process_ino_fiemap(xal, walk_root, root);
-	if (err) {
-		XAL_DEBUG("FAILED: process_ino_fiemap(); err(%d)", err);
-		goto exit;
+	// A read-lease region publishes no names: its readers attach the files they opened, and
+	// find the index that serves a file by xal_get_st_dev().
+	if (!(be->lease && xal->state)) {
+		err = process_ino_fiemap(xal, walk_root, root);
+		if (err) {
+			XAL_DEBUG("FAILED: process_ino_fiemap(); err(%d)", err);
+			goto exit;
+		}
 	}
 
 	if (be->reflink) {

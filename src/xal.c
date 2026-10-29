@@ -64,6 +64,15 @@ xal_inode_at(struct xal *xal, uint32_t idx)
 struct xal_extent *
 xal_extent_at(struct xal *xal, uint32_t idx)
 {
+	/* A file this process attached to a handle from xal_from_shm(), mapped in its own pool */
+	if (idx >= XAL_EXTENT_SHADOW_BASE) {
+		struct xal *shadow = atomic_load_explicit(&xal->shadow, memory_order_acquire);
+
+		if (shadow) {
+			xal = shadow;
+			idx -= XAL_EXTENT_SHADOW_BASE;
+		}
+	}
 	if (idx >= xal->extents.allocated) {
 		return NULL;
 	}
@@ -152,7 +161,7 @@ retrieve_mountpoint(const char *dev_uri, char *mntpnt)
  */
 static int
 publish_shared_state(struct xal *xal, const char *shm_name, const char *mountpoint,
-		     enum xal_backend be)
+		     enum xal_backend be, enum xal_watchmode watch_mode)
 {
 	char shm_name_state[XAL_PATH_MAXLEN + 9];
 	struct xal_shared_state *state;
@@ -204,7 +213,9 @@ publish_shared_state(struct xal *xal, const char *shm_name, const char *mountpoi
 
 	state->version = XAL_SHM_VERSION;
 	state->type = be;
+	state->watch_mode = watch_mode;
 	state->sb = xal->sb;
+	state->st_dev = xal->st_dev;
 	strncpy(state->mountpoint, mountpoint, XAL_PATH_MAXLEN - 1);
 	state->mountpoint[XAL_PATH_MAXLEN - 1] = '\0';
 
@@ -270,7 +281,8 @@ xal_open_from_uri(const char *uri, struct xal **xal, struct xal_opts *opts)
 	}
 
 	if (opts->shm_name) {
-		err = publish_shared_state(*xal, opts->shm_name, mountpoint, opts->be);
+		err = publish_shared_state(*xal, opts->shm_name, mountpoint, opts->be,
+					   opts->watch_mode);
 		if (err) {
 			XAL_DEBUG("FAILED: publish_shared_state(); err(%d)", err);
 			xal_close(*xal);
@@ -384,7 +396,8 @@ xal_open(struct xnvme_dev *dev, struct xal **xal, struct xal_opts *opts)
 	(*xal)->sb.lba_blksze = 1U << ns->lbaf[fidx].ds;
 
 	if (opts->shm_name) {
-		err = publish_shared_state(*xal, opts->shm_name, mountpoint, opts->be);
+		err = publish_shared_state(*xal, opts->shm_name, mountpoint, opts->be,
+					   opts->watch_mode);
 		if (err) {
 			XAL_DEBUG("FAILED: publish_shared_state(); err(%d)", err);
 			xal_close(*xal);
@@ -637,6 +650,7 @@ xal_from_shm(const char *shm_name, struct xal **out)
 	xal->index_state = &state->index_state;
 	xal->seq_lock = &state->seq_lock;
 	xal->sb = state->sb;
+	xal->st_dev = state->st_dev;
 
 	if (xal_is_dirty(xal)) {
 		err = -ESTALE;
@@ -1015,6 +1029,21 @@ search_by_traversal(struct xal *xal, struct xal_inode *root, char *path, char *b
 }
 
 int
+xal_get_st_dev(struct xal *xal, dev_t *st_dev)
+{
+	if (!xal || !st_dev) {
+		return -EINVAL;
+	}
+	if (!xal->st_dev) {
+		return -ENODEV;
+	}
+
+	*st_dev = (dev_t)xal->st_dev;
+
+	return 0;
+}
+
+int
 xal_get_inode(struct xal *xal, char *path, struct xal_inode **inode)
 {
 	struct xal_backend_base *be;
@@ -1029,6 +1058,12 @@ xal_get_inode(struct xal *xal, char *path, struct xal_inode **inode)
 	if (!path) {
 		XAL_DEBUG("FAILED: no path given");
 		return -EINVAL;
+	}
+
+	/* Not a missing name, which a reader would retry until the server indexed it */
+	if (xal_region_leased(xal)) {
+		XAL_DEBUG("FAILED: the region has no names; attach the file instead");
+		return -ENOTSUP;
 	}
 
 	if (xal_is_dirty(xal)) {

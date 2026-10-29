@@ -77,7 +77,8 @@ Every ``struct xal`` carries one of three roles, recorded internally as
 
 ``XAL_PROCROLE_SECONDARY``
    The handle came from ``xal_from_shm()``. It maps the objects read-only and
-   owns nothing.
+   owns nothing of them; files it attaches with ``xal_extents_attach_fd()``
+   are mapped in memory of its own.
 
 The role decides two things:
 
