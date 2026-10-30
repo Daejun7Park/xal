@@ -52,6 +52,85 @@ static struct {
     .lock = PTHREAD_MUTEX_INITIALIZER,
 };
 
+static pthread_once_t lease_atfork_once = PTHREAD_ONCE_INIT;
+/* What pthread_atfork() returned; without the handlers a forked child is not told apart */
+static int lease_atfork_err;
+
+/* Bumped in a forked child, which tells the sets it inherits apart without a getpid() call */
+static unsigned lease_generation;
+
+/*
+ * A forked child inherits its parent's open files, and with them the leases, but not its thread.
+ * lease_atfork_child() closes those of the sets it inherits, which then refuse to work, see
+ * lease_foreign(); the child starts with no sets.
+ */
+static void
+lease_atfork_prepare(void)
+{
+	pthread_mutex_lock(&lease_proc.lifecycle);
+	pthread_mutex_lock(&lease_proc.lock);
+	/* So that a child finds no entries[] or e->fd being changed */
+	for (struct xal_lease_set *ls = lease_proc.sets; ls; ls = ls->next) {
+		pthread_mutex_lock(&ls->lock);
+	}
+}
+
+static void
+lease_atfork_unlock_sets(void)
+{
+	for (struct xal_lease_set *ls = lease_proc.sets; ls; ls = ls->next) {
+		pthread_mutex_unlock(&ls->lock);
+	}
+}
+
+static void
+lease_atfork_parent(void)
+{
+	lease_atfork_unlock_sets();
+	pthread_mutex_unlock(&lease_proc.lock);
+	pthread_mutex_unlock(&lease_proc.lifecycle);
+}
+
+static void
+lease_atfork_child(void)
+{
+	/*
+	 * The child cannot use the leases, and its copies of their descriptors would keep them past
+	 * the parent's exit. Closed without F_UNLCK, which would drop them for the parent too.
+	 */
+	for (struct xal_lease_set *ls = lease_proc.sets; ls; ls = ls->next) {
+		for (size_t i = 0; i < ls->nentries; ++i) {
+			struct xal_lease_entry *e = &ls->entries[i];
+
+			if (e->fd >= 0) {
+				close(e->fd);
+				e->fd = -1;
+			}
+		}
+	}
+	lease_atfork_unlock_sets();
+	lease_generation++;
+	lease_proc.sets = NULL;
+	lease_proc.nsets = 0;
+	atomic_store(&lease_proc.tid, 0);
+	pthread_mutex_unlock(&lease_proc.lock);
+	pthread_mutex_unlock(&lease_proc.lifecycle);
+}
+
+static void
+lease_atfork_register(void)
+{
+	lease_atfork_err =
+	    pthread_atfork(lease_atfork_prepare, lease_atfork_parent, lease_atfork_child);
+}
+
+/* A set inherited across fork(), whose leases belong to the process that took them */
+static bool
+lease_foreign(const struct xal_lease_set *ls)
+{
+	return ls->generation != lease_generation;
+}
+
 struct ext_vec {
 	struct xal_extent *v;
 	uint32_t n;
@@ -91,7 +170,8 @@ lease_drop(struct xal_lease_set *ls, struct xal_lease_entry *e)
 		return;
 	}
 
-	if (fcntl(e->fd, F_SETLEASE, F_UNLCK)) {
+	/* In a forked child the lease is the parent's, which still counts on it */
+	if (!lease_foreign(ls) && fcntl(e->fd, F_SETLEASE, F_UNLCK)) {
 		XAL_DEBUG("FAILED: F_SETLEASE(F_UNLCK); errno(%d)", errno);
 	}
 
@@ -271,6 +351,11 @@ lease_proc_register(struct xal_lease_set *ls)
 {
 	int err = 0;
 
+	pthread_once(&lease_atfork_once, lease_atfork_register);
+	if (lease_atfork_err) {
+		return -lease_atfork_err;
+	}
+
 	pthread_mutex_lock(&lease_proc.lifecycle);
 	if (!lease_proc.nsets) {
 		err = lease_proc_start();
@@ -308,6 +393,7 @@ lease_proc_unregister(struct xal_lease_set *ls)
 	nsets = lease_proc.nsets;
 	pthread_mutex_unlock(&lease_proc.lock);
 
+	/* A set inherited across fork() is in no list here, and the thread is not this process's */
 	if (found && !nsets) {
 		lease_proc_stop();
 	}
@@ -521,6 +607,9 @@ xal_extents_acquire(struct xal *xal, struct xal_inode *inode, struct xal_extents
 		*extents = &inode->content.extents;
 		return 0;
 	}
+	if (lease_foreign(ls)) {
+		return -ECHILD;
+	}
 
 	idx = xal_inode_idx(xal, inode);
 	if (idx >= ls->nentries) {
@@ -585,6 +674,9 @@ xal_extents_release(struct xal *xal, struct xal_inode *inode)
 	if (!ls) {
 		return 0;
 	}
+	if (lease_foreign(ls)) {
+		return -ECHILD;
+	}
 
 	idx = xal_inode_idx(xal, inode);
 	if (idx >= ls->nentries) {
@@ -636,6 +728,23 @@ xal_be_fiemap_lease_reset(struct xal *xal, bool force)
 	struct xal_lease_set *ls = lease_set(xal);
 
 	if (!ls) {
+		return 0;
+	}
+
+	/*
+	 * lease_atfork_child() closed the descriptors of every set listed at fork(). What is still
+	 * open here belongs to a set that another thread was closing then; it is closed without
+	 * F_UNLCK, which would drop the parent's leases, and without ls->lock, which that thread
+	 * may have held.
+	 */
+	if (lease_foreign(ls)) {
+		if (!force) {
+			return -ECHILD;
+		}
+		for (uint32_t i = 0; i < ls->nentries; ++i) {
+			lease_drop(ls, &ls->entries[i]);
+		}
+		kh_clear(fd_to_idx, ls->fd_map);
 		return 0;
 	}
 
@@ -708,6 +817,7 @@ xal_be_fiemap_lease_init(struct xal *xal, const char *mountpoint)
 	}
 	ls->xal = xal;
 	ls->dev = st.st_dev;
+	ls->generation = lease_generation;
 	pthread_mutex_init(&ls->lock, NULL);
 
 	ls->fd_map = kh_init(fd_to_idx);

@@ -37,6 +37,7 @@ KHASH_MAP_INIT_INT(fd_to_idx, uint32_t)
 
 struct xal_lease_set {
 	struct xal *xal;
+	unsigned generation; ///< Of the process that took the leases; see lease_foreign()
 	dev_t dev;	     ///< Device of the mountpoint; a file elsewhere is not mapped
 	struct xal_lease_entry *entries; ///< Indexed like the inode pool
 	size_t nentries;

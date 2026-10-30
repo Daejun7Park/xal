@@ -705,7 +705,7 @@ xal_get_extents(struct xal *xal, char *path, struct xal_extents **extents);
  *
  * Every successful call must be paired with xal_extents_release() on the same inode. Neither may
  * run concurrently with xal_index() or xal_close() on the same handle, and xal_index() fails with
- * -EBUSY while extents are held.
+ * -EBUSY while extents are held. The leases belong to the process that opened the handle.
  *
  * @param xal The xal struct obtained when opened with xal_open() or xal_open_from_uri()
  * @param inode A regular file in the index
@@ -713,7 +713,8 @@ xal_get_extents(struct xal *xal, char *path, struct xal_extents **extents);
  *
  * @return On success, 0. -EAGAIN when the file is open for writing or its lease is being
  * recalled, -ESTALE when the indexed path now names another file, -EMFILE when the process is out
- * of descriptors, as every mapped file holds one, other negative errno on error.
+ * of descriptors, as every mapped file holds one, -ECHILD in a forked child, other negative errno
+ * on error.
  */
 int
 xal_extents_acquire(struct xal *xal, struct xal_inode *inode, struct xal_extents **extents);
@@ -724,7 +725,8 @@ xal_extents_acquire(struct xal *xal, struct xal_inode *inode, struct xal_extents
  * @param xal The xal struct obtained when opened with xal_open() or xal_open_from_uri()
  * @param inode The inode passed to xal_extents_acquire()
  *
- * @return On success, 0. -EINVAL when the file has no reader to count out.
+ * @return On success, 0. -EINVAL when the file has no reader to count out, -ECHILD in a forked
+ * child.
  */
 int
 xal_extents_release(struct xal *xal, struct xal_inode *inode);
