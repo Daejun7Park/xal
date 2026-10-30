@@ -171,13 +171,15 @@ xal_server_conf_from_toml(const char *path, struct xal_server_conf *conf)
 	if (datum.type != TOML_INT64) {
 		syslog(LOG_WARNING, "missing or invalid 'xal.watchmode', defaulting to none");
 	} else if ((datum.u.int64 != XAL_WATCHMODE_NONE) &&
-		   (datum.u.int64 != XAL_WATCHMODE_REFLINK_SNAPSHOT)) {
+		   (datum.u.int64 != XAL_WATCHMODE_REFLINK_SNAPSHOT) &&
+		   (datum.u.int64 != XAL_WATCHMODE_READ_LEASE)) {
 		/* Refused rather than defaulted away: a config naming a mode that does not exist
 		 * must not come up silently watching nothing. */
 		syslog(LOG_CRIT,
-		       "'xal.watchmode' %ld is not a watch mode; use %d (none) or %d (reflink "
-		       "snapshot)",
-		       (long)datum.u.int64, XAL_WATCHMODE_NONE, XAL_WATCHMODE_REFLINK_SNAPSHOT);
+		       "'xal.watchmode' %ld is not a watch mode; use %d (none), %d (reflink "
+		       "snapshot) or %d (read lease)",
+		       (long)datum.u.int64, XAL_WATCHMODE_NONE, XAL_WATCHMODE_REFLINK_SNAPSHOT,
+		       XAL_WATCHMODE_READ_LEASE);
 		toml_free(result);
 		return -EINVAL;
 	} else {

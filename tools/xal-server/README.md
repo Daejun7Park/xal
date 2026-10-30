@@ -30,7 +30,7 @@ devices = [
 ]
 
 [xal]
-# none = 0, reflink snapshot = 1. Nothing else is valid; see enum xal_watchmode.
+# none = 0, reflink snapshot = 1, read lease = 3. Nothing else is valid; see enum xal_watchmode.
 #
 #   none              nothing is watched and nothing is pinned. The published extents are a
 #                     snapshot of the filesystem as it was at index time and a foreign write can
@@ -39,6 +39,10 @@ devices = [
 #   reflink snapshot  every indexed file is cloned into a shadow directory, so the blocks stay
 #                     pinned and readers keep valid LBAs under foreign writes. Needs an XFS
 #                     mount made with reflink=1, and CAP_LINUX_IMMUTABLE to protect the clones.
+#   read lease        the index has no names or extents, and the server opens and walks
+#                     nothing. A reader picks the index by xal_get_st_dev(), attaches the files
+#                     it opened with xal_extents_attach_fd() and takes their extents from
+#                     xal_extents_acquire(), under a lease of its own.
 watchmode = 0
 ```
 
@@ -48,7 +52,7 @@ watchmode = 0
 | `devices[].uri` | yes | block device to index; must be mounted |
 | `devices[].shm_name` | yes | name readers pass to `xal_from_shm()` |
 | `devices[].mountpoint` | no | looked up in `/proc/mounts` when omitted |
-| `devices[].subtree` | no | absolute path at or under the mountpoint to restrict the index to |
+| `devices[].subtree` | no | absolute path at or under the mountpoint to restrict the index to; not with `read lease` |
 | `xal.watchmode` | no | see `enum xal_watchmode`; defaults to none |
 
 `shm_name` is spelled out rather than derived from the position in `devices`, because readers
@@ -84,7 +88,8 @@ then.
 
 ## Reading an index
 
-A reader attaches with `xal_from_shm()` and gets a read-only handle supporting the full query API.
+A reader attaches with `xal_from_shm()` and gets a read-only handle supporting the full query API,
+except with `read lease`, whose index has no names.
 Everything else -- superblock, backend, mountpoint, root inode -- comes out of the shared state
 region, so nothing has to be passed alongside the name.
 
@@ -121,7 +126,7 @@ two were built against different xal versions. Retrying never clears it; rebuild
 
 ## Staying current
 
-With a watch mode other than `none`, the server watches each filesystem and re-indexes when it
+With `reflink snapshot`, the server watches each filesystem and re-indexes when it
 changes, rewriting the pools in place under a sequence lock. Attached readers see the update
 without reattaching, but a walk that raced the rewrite fails with `-ESTALE`; check
 `xal_is_dirty()`, or retry.
@@ -129,6 +134,11 @@ without reattaching, but a walk that raced the rewrite fails with `-ESTALE`; che
 `XAL_WATCHMODE_REFLINK_SNAPSHOT` also pins the blocks, so that only a re-index by this server can
 change what a reader sees. See `enum xal_watchmode` in `libxal.h` for the guarantee in
 full.
+
+With `read lease`, the index holds no names, and a reader leases the files it attaches; see
+`xal_extents_attach_fd()`. It finds the index that serves a file by comparing the file's
+`st_dev` with `xal_get_st_dev()`. The server opens no file, so it breaks no reader's lease, and a
+file created after the server started can be attached at once, without marking the index.
 
 With `none`, nothing is watched: a reader that changed the filesystem itself, say by an
 allocating write, calls `xal_mark_dirty()` on its handle. The server polls for that mark every
@@ -157,6 +167,6 @@ the reader's buffer. On a mount the reader already has read access to, that is a
 problem solved by discarding and retrying -- treat it as an isolation problem only if the reader
 is not trusted with the rest of the filesystem.
 
-If re-indexing fails, the server logs it at ERROR and the index stays dirty. With a watch mode
-other than `none`, the next change the watch sees triggers another attempt; with `none`, the
-backoff above does.
+If re-indexing fails, the server logs it at ERROR and the index stays dirty. With `reflink
+snapshot`, the next change the watch sees triggers another attempt; with `none` and `read lease`,
+the backoff above does.
