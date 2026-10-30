@@ -124,16 +124,28 @@ by a filesystem-wide `fanotify` mark, which needs `CAP_SYS_ADMIN`.
   `-EAGAIN` for it. `xal_get_extents()` and `xal_walk()` report no extents
   for a file until it has been acquired, nor after its lease is gone.
 
+A caller that opens its files and registers them before reading can hand the
+descriptor to `xal_extents_attach_fd()`, which takes the lease on it and maps
+the file then, so the first `xal_extents_acquire()` makes no system call
+either. The caller keeps the descriptor open until `xal_extents_detach_fd()`,
+`xal_index()` or `xal_close()`; xal never closes it. On a descriptor open for
+writing the lease is a write lease: it needs the file to be open nowhere else,
+and any other `open()` or `truncate()` of the file then waits for the readers.
+Writes through that descriptor do not wait; the next `xal_extents_release()`
+finds them by the file's size and ctime and returns `-ESTALE`, and the next
+acquire maps the file again.
+
 Where `XAL_WATCHMODE_REFLINK_SNAPSHOT` lets writers go ahead and keeps the
 old data for readers, this mode makes writers wait for readers, and writes
 nothing to the filesystem itself. It needs:
 
 * the files to be owned by the caller, or `CAP_LEASE`, and
   `/proc/sys/fs/leases-enable` to be 1
-* one file descriptor per file under a lease. Past `xal_opts.lease_max`, by
-  default half the soft `RLIMIT_NOFILE`, or when out of descriptors, xal
-  drops the lease of a file without readers that was not acquired since the
-  last pass, and maps it again on its next `xal_extents_acquire()`
+* one file descriptor per file under a lease, except attached files, which
+  use the caller's. Past `xal_opts.lease_max`, by default half the soft
+  `RLIMIT_NOFILE`, or when out of descriptors, xal drops the lease of a file
+  without readers that was not acquired since the last pass, and maps it
+  again on its next `xal_extents_acquire()`
 * readers to release within `/proc/sys/fs/lease-break-time` seconds, after
   which the kernel lets a waiting writer through anyway; a later
   `xal_extents_release()` returns `-ESTALE` once xal's thread has taken the
@@ -168,8 +180,33 @@ made by `cp --reflink` have, also wait for each other on the allocation
 group. `xal_opts.lease_no_recheck` leaves the FIEMAP out. Writes to the block
 device itself are not seen.
 
-It does not support `shm_name`. See `xal_extents_acquire()` and
-`xal_extents_release()` in `include/libxal.h`.
+With `xal_extents_attach_fd()` the lease is taken on the caller's own
+descriptor, a read lease when it is open read-only and a write lease
+otherwise. The descriptor must stay open, and name that file, until
+`xal_extents_detach_fd()`, `xal_index()` or `xal_close()`: closing it drops
+the lease without xal noticing. Its open file must not hold a lease of the
+caller's own, and may be attached once: not again through a `dup()`, nor for
+another name of the file, nor in another handle. Open it with `O_CLOEXEC`; a
+child forked without exec keeps the lease.
+
+A write lease is granted only while the descriptor's open file is the file's
+only one. Any other `open()`, a read-only or failed `O_NONBLOCK` one
+included, and `truncate()` break it, and while that open file stays open
+`xal_extents_acquire()` returns `-EAGAIN`. A thread holding the extents must
+therefore not open the file itself: the open waits for its own release, up
+to lease-break-time. Writes, `ftruncate()`, `fallocate()`, clones and stores
+through a shared mapping of the descriptor break nothing. They change the
+file's ctime, and the next `xal_extents_release()` returns `-ESTALE` when the
+size or ctime differs from the mapping's; a change of the file's metadata,
+as `chmod()`, `setxattr()` or a new link, does too. Not seen: writes through
+a descriptor opened with `XFS_IOC_OPEN_BY_HANDLE`, which updates no ctime;
+without multigrain timestamps (XFS before Linux 6.13), a write in the same
+clock tick as the mapping; and an `O_DIRECT` write still in flight while the
+file is mapped, which the release's FIEMAP finds unless
+`xal_opts.lease_no_recheck` is set.
+
+It does not support `shm_name`. See `xal_extents_acquire()`,
+`xal_extents_release()` and `xal_extents_attach_fd()` in `include/libxal.h`.
 
 #### File lookup modes
 

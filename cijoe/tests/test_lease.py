@@ -27,6 +27,9 @@ FMR_OWN_FREE = "special_0:1"
 EINVAL = 22
 ENOTSUP = 95
 ESTALE = 116
+EAGAIN = 11
+EBUSY = 16
+F_RDLCK, F_WRLCK, F_UNLCK = 0, 1, 2
 
 
 @pytest.fixture(autouse=True)
@@ -618,3 +621,188 @@ def test_lease_rejects_shm(cijoe):
 
     out = _capture(cijoe, f"sudo xal_lease_hold {dev_path} {mountpoint} {mountpoint} --shm")
     assert f"OPEN err=-{ENOTSUP}" in out, out
+
+
+def test_lease_attach_writer_waits_for_reader(cijoe):
+    """A lease taken on the caller's read-only descriptor holds a writer back as one of xal's own
+    does, and is taken again on that descriptor once the writer is done."""
+
+    _writer_waits_for_reader(cijoe, "xal_lease_attach", "--attach")
+
+
+def test_lease_attach_rw_holds_off_readers(cijoe):
+    """On a descriptor open for writing the lease is a write lease, so another process's read-only
+    open() also waits for the readers, and the file is mapped again once it has closed."""
+
+    dev_path, mountpoint = _require_fixture(cijoe)
+    path = f"{mountpoint}/xal_lease_attach_rw"
+    _fill(cijoe, path, "A", 4096)
+
+    pid, _, log = _start_hold(cijoe, dev_path, mountpoint, path, "--attach-rw")
+    try:
+        assert f"ATTACH err=0 lease={F_WRLCK}" in log.read_text(), log.read_text()
+        reader = _timed(
+            cijoe, "lease_reader", f"dd if={path} of=/dev/null bs=4096 count=1 status=none"
+        )
+        time.sleep(1)
+        assert "took_ms" not in (reader.read_text() if reader.exists() else ""), (
+            "the reader was not held back by the write lease"
+        )
+
+        cijoe.run(f"sudo kill -USR1 {pid}")
+        took = int(_wait_for(reader, TOOK_RE, 10).group(1))
+        assert took >= 900, f"reader took {took} ms, less than the 1 s the extents were held"
+        assert int(_wait_for(log, RELEASED_RE, 10).group(1)) == 0, "held extents reported stale"
+        _wait_for(log, REACQUIRED_RE, 30)
+    finally:
+        _stop_hold(cijoe, pid)
+    closed = f"CLOSED lease={F_UNLCK} fd_open=1"
+    assert closed in log.read_text(), f"xal_close() did not release and keep fd:\n{log.read_text()}"
+
+    cijoe.run(f"rm -f {path}")
+
+
+def test_lease_attach_rw_refused_while_open_elsewhere(cijoe):
+    """A write lease needs the caller's descriptor to be the file's only open file, so a reader
+    elsewhere keeps it from being taken."""
+
+    dev_path, mountpoint = _require_fixture(cijoe)
+    path = f"{mountpoint}/xal_lease_attach_shared"
+    _fill(cijoe, path, "A", 4096)
+
+    fifo = _artifacts(cijoe) / "lease_attach_shared.fifo"
+    cijoe.run(f"rm -f {fifo}")
+    cijoe.run(f"mkfifo {fifo}")
+    holder = _background(
+        cijoe,
+        "lease_reader_holder",
+        f"exec 3<{path}\necho opened\nread line < {fifo}\nexec 3<&-\necho closed\n",
+    )
+    _wait_for(holder, re.compile("opened"), 10)
+
+    hold = f"sudo xal_lease_hold --attach-rw {dev_path} {mountpoint} {path} --probe"
+    out = _capture(cijoe, hold)
+    assert f"ATTACH err=-{EAGAIN}" in out, f"write lease taken while open elsewhere:\n{out}"
+
+    cijoe.run(f"sh -c 'echo done > {fifo}'")
+    _wait_for(holder, re.compile("closed"), 10)
+
+    out = _capture(cijoe, hold)
+    assert f"ATTACH err=0 lease={F_WRLCK}" in out, f"refused after the reader closed:\n{out}"
+    assert "ACQUIRE err=0" in out, out
+
+    # A failed attach leaves nothing behind: in one process, a retry works once the reader is gone
+    out = _capture(cijoe, hold.replace("--attach-rw", "--attach-rw --hold-open"))
+    assert f"ATTACH err=-{EAGAIN}" in out, out
+    assert f"ATTACH_RETRY err=0 lease={F_WRLCK}" in out, f"retry after a failed attach:\n{out}"
+
+    cijoe.run(f"rm -f {path} {fifo}")
+
+
+def _own_write_found(cijoe, name, option=""):
+    """A write through the descriptor holding a write lease breaks nothing and moves no extent;
+    the release finds it by the file's ctime, and the next acquire maps the file with the write on
+    the device."""
+
+    dev_path, mountpoint = _require_fixture(cijoe)
+    path = f"{mountpoint}/{name}"
+    _fill(cijoe, path, "A", 4096)
+
+    pid, _, log = _start_hold(
+        cijoe, dev_path, mountpoint, path, f"--attach-rw --write-own {option}"
+    )
+    try:
+        text = log.read_text()
+        assert f"WROTE err=0 lease={F_WRLCK} byte=W" in text, text
+
+        cijoe.run(f"sudo kill -USR1 {pid}")
+        err = int(_wait_for(log, RELEASED_RE, 10).group(1))
+        assert err == -ESTALE, f"release returned {err} after a write through the descriptor"
+        m = _wait_for(log, REACQUIRED_RE, 30)
+        assert _raw(cijoe, dev_path, int(m.group(1)), 1) == "W", "remapped extent lacks the write"
+    finally:
+        _stop_hold(cijoe, pid)
+
+    cijoe.run(f"rm -f {path}")
+
+
+def test_lease_attach_rw_own_write_found(cijoe):
+    _own_write_found(cijoe, "xal_lease_attach_own")
+
+
+def test_lease_attach_rw_own_write_found_with_no_recheck(cijoe):
+    """lease_no_recheck leaves out the FIEMAP, not the write lease's size and ctime check."""
+
+    _own_write_found(cijoe, "xal_lease_attach_own_nr", "--no-recheck")
+
+
+def test_lease_attach_after_own_mapping(cijoe):
+    """A file already under a lease of xal's own can be attached: xal drops its own descriptor and
+    lease, and the one on the caller's descriptor is the only one left."""
+
+    dev_path, mountpoint = _require_fixture(cijoe)
+    path = f"{mountpoint}/xal_lease_attach_late"
+    _fill(cijoe, path, "A", 4096)
+
+    out = _capture(
+        cijoe, f"sudo xal_lease_hold --map-first --attach {dev_path} {mountpoint} {path} --probe"
+    )
+    assert "MAPPED err=0" in out, out
+    assert f"ATTACH err=0 lease={F_RDLCK}" in out, f"attach after xal's own lease failed:\n{out}"
+    assert "LEASES=1" in out, f"xal's own lease was not dropped:\n{out}"
+    assert "ACQUIRE err=0" in out, out
+
+    cijoe.run(f"rm -f {path}")
+
+
+def test_lease_attach_not_evicted(cijoe):
+    """Attached files are not counted against lease_max and not dropped to stay within it."""
+
+    dev_path, mountpoint = _require_fixture(cijoe)
+    path, idle = f"{mountpoint}/xal_lease_attach_kept", f"{mountpoint}/xal_lease_attach_idle"
+    _fill(cijoe, path, "A", 4096)
+    cijoe.run(f"mkdir -p {idle}")
+    for i in range(3):
+        _fill(cijoe, f"{idle}/f{i}", "A", 4096, sync=False)
+    cijoe.run("sync")
+
+    pid, _, log = _start_hold(
+        cijoe, dev_path, mountpoint, path, f"--attach --max 1 --idle {idle}"
+    )
+    try:
+        m = re.search(r"IDLE_DONE lease=(\d+) evicted=(\d+)", log.read_text())
+        assert m, log.read_text()
+        assert int(m.group(1)) == F_RDLCK, f"the attached file lost its lease:\n{log.read_text()}"
+        assert int(m.group(2)) >= 2, f"lease_max 1 dropped too few:\n{log.read_text()}"
+    finally:
+        cijoe.run(f"sudo kill -USR1 {pid}")
+        _stop_hold(cijoe, pid)
+
+    cijoe.run(f"rm -rf {path} {idle}")
+
+
+def test_lease_attach_once_and_detach(cijoe):
+    """An open file is attached once: not again for the same file, nor for a hard link of it,
+    also after its lease was broken. Detaching waits for no reader, releases the lease and leaves
+    the descriptor open."""
+
+    dev_path, mountpoint = _require_fixture(cijoe)
+    path, link = f"{mountpoint}/xal_lease_attach_once", f"{mountpoint}/xal_lease_attach_link"
+    _fill(cijoe, path, "A", 4096)
+    cijoe.run(f"ln -f {path} {link}")
+
+    out = _capture(
+        cijoe, f"sudo xal_lease_hold --attach --link {link} {dev_path} {mountpoint} {path} --probe"
+    )
+    assert f"ATTACH err=0 lease={F_RDLCK}" in out, out
+    assert "ACQUIRE err=0" in out and "RELEASE err=0" in out, out
+    assert f"DETACH_HELD err=-{EBUSY}" in out, f"detached with a reader:\n{out}"
+    assert "BROKEN revoked=1" in out, f"the lease was not broken:\n{out}"
+    assert f"ATTACH_LINK err=-{EBUSY}" in out, f"attached again for a hard link:\n{out}"
+    assert f"ATTACH_AGAIN err=-{EBUSY}" in out, f"attached twice:\n{out}"
+    assert f"ATTACH_DUP err=-{EBUSY}" in out, f"attached again through a dup():\n{out}"
+    assert f"DETACH err=0 lease={F_UNLCK} fd_open=1" in out, out
+    assert f"ATTACH_AFTER_DETACH err=0 lease={F_RDLCK}" in out, f"no attach after detach:\n{out}"
+    assert f"DETACH_VALID err=0 lease={F_UNLCK} fd_open=1" in out, f"detach kept the lease:\n{out}"
+
+    cijoe.run(f"rm -f {path} {link}")

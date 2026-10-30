@@ -8,11 +8,30 @@
  * hold the file's data meanwhile.
  *
  * Usage: xal_lease_hold [--no-recheck] [--max <n>] [--exhaust]
+ *                       [--attach | --attach-rw [--write-own]] [--map-first] [--hold-open]
+ *                       [--link <file2>]
  *                       [--probe | --shm | --thread | --fork | --orphan | --idle <file2> |
- *                        --sweep]
- *                       <dev_uri> <mountpoint> <file>
+ *                        --sweep] <dev_uri> <mountpoint> <file>
  *
- * --no-recheck sets xal_opts.lease_no_recheck and --max xal_opts.lease_max. --exhaust opens
+ * --no-recheck sets xal_opts.lease_no_recheck and --max xal_opts.lease_max. --attach opens <file>
+ * read-only, --attach-rw read-write, and hands the descriptor to xal_extents_attach_fd() before
+ * anything else, printing ATTACH err=<err> lease=<F_GETLEASE of it>; on an error, --probe exits
+ * there and the other modes fail. --map-first, between that open and the attach, acquires and
+ * releases <file> under a lease of xal's own, printing MAPPED err=<err>, and after the attach
+ * prints LEASES=<leases on <file> in /proc/locks>. After xal_close() it prints CLOSED
+ * lease=<F_GETLEASE> fd_open=<1 if the descriptor is still open>. --write-own, before LEASE_READY,
+ * writes "W" at offset 0 through the descriptor, printing WROTE err=<err> lease=<F_GETLEASE>
+ * byte=<the file's first byte as read through it>. With --idle, IDLE_DONE lease=<F_GETLEASE>
+ * evicted=<n> follows the idle files. With an attached descriptor, --probe also prints DETACH_HELD
+ * err=<err> for a detach between the acquire and the release, then, with --link <file2>, a hard
+ * link of <file>, breaks the lease with its own O_NONBLOCK open for writing, prints BROKEN
+ * revoked=<n> once xal has revoked it and ATTACH_LINK err=<err> for attaching the descriptor to
+ * <file2>; then ATTACH_AGAIN err=<err> for attaching it again, ATTACH_DUP err=<err> for attaching a
+ * dup() of it, DETACH err=<err> lease=<F_GETLEASE> fd_open=<n>, ATTACH_AFTER_DETACH err=<err>
+ * lease=<F_GETLEASE> for attaching it after that, and DETACH_VALID err=<err> lease=<F_GETLEASE>
+ * fd_open=<n> for detaching it with the lease held.
+ * --hold-open opens <file> read-only before the attach and closes it after, printing ATTACH_RETRY
+ * err=<err> lease=<F_GETLEASE> for attaching again if the attach failed. --exhaust opens
  * /dev/null until no descriptor is left, after the extents are held, and acquires no more. Without
  * a mode option, prints once the extents are held:
  *   LEASE_READY pid=<pid> byte=<device byte offset of the first extent> extents=<n>
@@ -64,6 +83,11 @@
 static volatile sig_atomic_t g_release = 0;
 static bool g_exhaust;
 static volatile sig_atomic_t g_stop = 0;
+static int g_attach = -1; ///< open() flags of --attach or --attach-rw
+static int g_fd = -1;	  ///< The attached descriptor
+static bool g_write_own;
+static bool g_map_first;
+static bool g_hold_open;
 
 static void
 on_signal(int signo)
@@ -86,11 +110,11 @@ first_byte(struct xal *xal, struct xal_extents *extents)
 }
 
 static int
-probe(struct xal *xal, struct xal_inode *inode)
+probe(struct xal *xal, struct xal_inode *inode, struct xal_inode *link)
 {
 	struct xal_extents *extents;
 	uint32_t blocksize = xal_get_sb_blocksize(xal);
-	int err;
+	int err, dup_fd;
 
 	err = xal_extents_acquire(xal, inode, &extents);
 	printf("ACQUIRE err=%d\n", err);
@@ -104,8 +128,50 @@ probe(struct xal *xal, struct xal_inode *inode)
 		printf("EXTENT %u byte=%" PRIu64 " bytes=%" PRIu64 " flag=0x%02x\n", i,
 		       extent->start_block * blocksize, extent->nblocks * blocksize, extent->flag);
 	}
+	if (g_fd >= 0) {
+		printf("DETACH_HELD err=%d\n", xal_extents_detach_fd(xal, inode));
+	}
 	printf("RELEASE err=%d\n", xal_extents_release(xal, inode));
 	printf("RELEASE_AGAIN err=%d\n", xal_extents_release(xal, inode));
+	if (g_fd < 0) {
+		return 0;
+	}
+
+	if (link) {
+		struct timespec tick = {.tv_sec = 0, .tv_nsec = 10 * 1000 * 1000};
+		struct xal_lease_stats before = {0}, after = {0};
+		char path[XAL_INODE_PATH_MAXLEN + 1];
+
+		/* Broken, the lease leaves fd_map; the descriptor stays attached */
+		xal_lease_stats(xal, &before);
+		if (xal_inode_path(xal, inode, path, sizeof(path)) >= 0) {
+			int fd = open(path, O_WRONLY | O_NONBLOCK);
+
+			if (fd >= 0) {
+				close(fd);
+			}
+		}
+		for (int i = 0; i < 200 && after.revoked == before.revoked; ++i) {
+			nanosleep(&tick, NULL);
+			xal_lease_stats(xal, &after);
+		}
+		printf("BROKEN revoked=%" PRIu64 "\n", after.revoked - before.revoked);
+		printf("ATTACH_LINK err=%d\n", xal_extents_attach_fd(xal, link, g_fd, NULL));
+	}
+	printf("ATTACH_AGAIN err=%d\n", xal_extents_attach_fd(xal, inode, g_fd, NULL));
+	dup_fd = dup(g_fd);
+	printf("ATTACH_DUP err=%d\n", xal_extents_attach_fd(xal, inode, dup_fd, NULL));
+	close(dup_fd);
+	err = xal_extents_detach_fd(xal, inode);
+	printf("DETACH err=%d lease=%d fd_open=%d\n", err, fcntl(g_fd, F_GETLEASE),
+	       fcntl(g_fd, F_GETFD) >= 0);
+	err = xal_extents_attach_fd(xal, inode, g_fd, NULL);
+	printf("ATTACH_AFTER_DETACH err=%d lease=%d\n", err, fcntl(g_fd, F_GETLEASE));
+	if (!err) {
+		err = xal_extents_detach_fd(xal, inode);
+		printf("DETACH_VALID err=%d lease=%d fd_open=%d\n", err, fcntl(g_fd, F_GETLEASE),
+		       fcntl(g_fd, F_GETFD) >= 0);
+	}
 
 	return 0;
 }
@@ -332,6 +398,13 @@ hold(struct xal *xal, struct xal_inode *inode, struct xal_inode *idle, bool on_t
 		}
 		xal_extents_release(xal, idle);
 	}
+	if (idle && g_fd >= 0) {
+		struct xal_lease_stats stats = {0};
+
+		xal_lease_stats(xal, &stats);
+		printf("IDLE_DONE lease=%d evicted=%" PRIu64 "\n", fcntl(g_fd, F_GETLEASE),
+		       stats.evicted);
+	}
 
 	if (on_thread) {
 		pthread_t t;
@@ -348,6 +421,15 @@ hold(struct xal *xal, struct xal_inode *inode, struct xal_inode *idle, bool on_t
 	if (err) {
 		fprintf(stderr, "FAILED: xal_extents_acquire(); err(%d)\n", err);
 		return 1;
+	}
+	if (g_write_own) {
+		char byte = '?';
+
+		err = pwrite(g_fd, "W", 1, 0) == 1 ? 0 : -errno;
+		if (pread(g_fd, &byte, 1, 0) != 1) {
+			byte = '?';
+		}
+		printf("WROTE err=%d lease=%d byte=%c\n", err, fcntl(g_fd, F_GETLEASE), byte);
 	}
 	/* Left open, so that nothing is free when the lease is broken and released */
 	while (g_exhaust && open("/dev/null", O_RDONLY) >= 0) {
@@ -401,16 +483,24 @@ main(int argc, char *argv[])
 	    {"no-recheck", no_argument, NULL, 'r'},
 	    {"max", required_argument, NULL, 'm'},
 	    {"exhaust", no_argument, NULL, 'x'},
+	    {"attach", no_argument, NULL, 'a'},
+	    {"attach-rw", no_argument, NULL, 'A'},
+	    {"write-own", no_argument, NULL, 'W'},
+	    {"map-first", no_argument, NULL, 'M'},
+	    {"hold-open", no_argument, NULL, 'H'},
+	    {"link", required_argument, NULL, 'L'},
 	    {NULL, 0, NULL, 0},
 	};
 	struct xal_opts opts = {0};
 	struct sigaction sa = {0};
 	sigset_t block, orig;
-	struct xal_inode *inode, *idle = NULL;
-	char *idle_path = NULL;
+	struct xal_inode *inode, *idle = NULL, *link = NULL;
+	char *idle_path = NULL, *link_path = NULL;
 	struct xal *xal;
 	int c, mode = 0, err, ret;
 
+	/* Line by line, so that a test sees what was printed before a crash */
+	setvbuf(stdout, NULL, _IOLBF, 0);
 	while ((c = getopt_long(argc, argv, "", longopts, NULL)) != -1) {
 		if (c == 'r') {
 			opts.lease_no_recheck = 1;
@@ -424,6 +514,26 @@ main(int argc, char *argv[])
 			g_exhaust = true;
 			continue;
 		}
+		if (c == 'a' || c == 'A') {
+			g_attach = c == 'a' ? O_RDONLY : O_RDWR;
+			continue;
+		}
+		if (c == 'W') {
+			g_write_own = true;
+			continue;
+		}
+		if (c == 'M') {
+			g_map_first = true;
+			continue;
+		}
+		if (c == 'H') {
+			g_hold_open = true;
+			continue;
+		}
+		if (c == 'L') {
+			link_path = optarg;
+			continue;
+		}
 		if (c == '?' || mode) {
 			mode = '?';
 			break;
@@ -433,9 +543,11 @@ main(int argc, char *argv[])
 			idle_path = optarg;
 		}
 	}
-	if (mode == '?' || argc - optind != 3) {
+	if (mode == '?' || argc - optind != 3 || (g_write_own && g_attach != O_RDWR)) {
 		fprintf(stderr,
 			"Usage: %s [--no-recheck] [--max <n>] [--exhaust] "
+			"[--attach | --attach-rw [--write-own]] [--map-first] [--hold-open] "
+			"[--link <file2>] "
 			"[--probe | --shm | --thread | --fork | --orphan | --idle <file2> | "
 			"--sweep] "
 			"<dev_uri> <mountpoint> <file>\n",
@@ -483,14 +595,51 @@ main(int argc, char *argv[])
 	if (!err && idle_path) {
 		err = xal_get_inode(xal, idle_path, &idle);
 	}
+	if (!err && link_path) {
+		err = xal_get_inode(xal, link_path, &link);
+	}
 	if (err) {
 		fprintf(stderr, "FAILED: xal_index() or xal_get_inode(); err(%d)\n", err);
 		xal_close(xal);
 		return 1;
 	}
 
+	if (g_attach >= 0) {
+		int open_err, held = -1;
+
+		g_fd = open(argv[2], g_attach | O_CLOEXEC);
+		open_err = g_fd < 0 ? -errno : 0;
+		if (g_hold_open) {
+			held = open(argv[2], O_RDONLY | O_CLOEXEC);
+		}
+		if (g_map_first) {
+			struct xal_extents *extents;
+
+			err = xal_extents_acquire(xal, inode, &extents);
+			printf("MAPPED err=%d\n", err ? err : xal_extents_release(xal, inode));
+		}
+		err = open_err ? open_err : xal_extents_attach_fd(xal, inode, g_fd, NULL);
+		printf("ATTACH err=%d lease=%d\n", err, g_fd < 0 ? -1 : fcntl(g_fd, F_GETLEASE));
+		if (held >= 0) {
+			close(held);
+			if (err && !open_err) {
+				err = xal_extents_attach_fd(xal, inode, g_fd, NULL);
+				printf("ATTACH_RETRY err=%d lease=%d\n", err,
+				       fcntl(g_fd, F_GETLEASE));
+			}
+		}
+		if (g_map_first) {
+			printf("LEASES=%d\n", count_leases(inode->ino));
+		}
+		fflush(stdout);
+		if (err) {
+			xal_close(xal);
+			return mode == 'p' ? 0 : 1;
+		}
+	}
+
 	if (mode == 'p') {
-		ret = probe(xal, inode);
+		ret = probe(xal, inode, link);
 	} else if (mode == 'f') {
 		ret = fork_probe(xal, inode);
 	} else if (mode == 'o') {
@@ -502,6 +651,11 @@ main(int argc, char *argv[])
 	}
 
 	xal_close(xal);
+	if (g_fd >= 0) {
+		printf("CLOSED lease=%d fd_open=%d\n", fcntl(g_fd, F_GETLEASE),
+		       fcntl(g_fd, F_GETFD) >= 0);
+		close(g_fd);
+	}
 
 	return ret;
 }

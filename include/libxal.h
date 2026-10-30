@@ -707,28 +707,29 @@ xal_get_extents(struct xal *xal, char *path, struct xal_extents **extents);
 /**
  * Pin the extents of a regular file for raw reads
  *
- * With XAL_WATCHMODE_READ_LEASE, the first call for a file opens it read-only, takes a read lease
- * on it and maps it as xal_index() does, leaving out extents past the end of the file or cutting
- * them at the block holding it. Each call counts the caller as a reader until
- * xal_extents_release(). A writer's open() or truncate() of the file breaks the lease; the writer
- * waits until the last reader has released, xal then releases the lease, and the next call maps
- * the file again. Between the two calls the extents therefore describe the file's blocks, unless a
- * writeback of the file failed, see xal_index(), or xal_extents_release() returns an error. In
- * other watch modes this returns the indexed extents and pins nothing. README.md lists what the
- * mode needs and what it does not see.
+ * With XAL_WATCHMODE_READ_LEASE, the first call for a file not attached with
+ * xal_extents_attach_fd() opens it read-only, takes a read lease on it and maps it as xal_index()
+ * does, leaving out extents past the end of the file or cutting them at the block holding it. Each
+ * call counts the caller as a reader until xal_extents_release(). A writer's open() or truncate()
+ * of the file breaks the lease; the writer waits until the last reader has released, xal then
+ * releases the lease, and the next call maps the file again. Between the two calls the extents
+ * therefore describe the file's blocks, unless a writeback of the file failed, see xal_index(), or
+ * xal_extents_release() returns an error. In other watch modes this returns the indexed extents
+ * and pins nothing. README.md lists what the mode needs and what it does not see.
  *
- * Every successful call must be paired with xal_extents_release() on the same inode. Neither may
- * run concurrently with xal_index() or xal_close() on the same handle, and xal_index() fails with
- * -EBUSY while extents are held. The leases belong to the process that opened the handle.
+ * Every successful call must be paired with xal_extents_release() on the same inode. Neither, nor
+ * xal_extents_attach_fd() or xal_extents_detach_fd(), may run concurrently with xal_index() or
+ * xal_close() on the same handle, and xal_index() fails with -EBUSY while extents are held. The
+ * leases belong to the process that opened the handle.
  *
  * @param xal The xal struct obtained when opened with xal_open() or xal_open_from_uri()
  * @param inode A regular file in the index
  * @param extents Set to the file's extents on success
  *
- * @return On success, 0. -EAGAIN when the file is open for writing or its lease is being
- * recalled, -ESTALE when the indexed path now names another file, -EMFILE when xal is out of
- * descriptors and every file holding one has readers, -ECHILD in a forked child, other negative
- * errno on error.
+ * @return On success, 0. -EAGAIN when the lease cannot be taken (the file is open for writing, or,
+ * for a write lease, open elsewhere at all) or is being recalled, -ESTALE when the indexed path now
+ * names another file, -EMFILE when xal is out of descriptors and every file holding one has
+ * readers, -ECHILD in a forked child, other negative errno on error.
  */
 int
 xal_extents_acquire(struct xal *xal, struct xal_inode *inode, struct xal_extents **extents);
@@ -739,13 +740,15 @@ xal_extents_acquire(struct xal *xal, struct xal_inode *inode, struct xal_extents
  * Call it once every read or DMA through the extents has completed. With
  * XAL_WATCHMODE_READ_LEASE it returns -ESTALE when the kernel has let a writer past the file's
  * broken lease, as it does after lease-break-time, or when an earlier release found the extents
- * stale. Otherwise it maps the file again with FIEMAP and returns -ESTALE when the extents differ,
- * which finds changes that break no lease, at the cost of a FIEMAP per release, see README.md.
- * xal_opts.lease_no_recheck leaves it out. After -ESTALE the file is mapped again on a later
- * xal_extents_acquire(). Not seen: a mapping that changed and changed back, writes to the block
- * device, and a break that xal's thread has not taken yet; when /proc/self/fdinfo cannot be read,
- * as without /proc, one taken more than 250 ms after the kernel issued it, with lease-break-time
- * as last read, 45 s if never. In other watch modes this does nothing.
+ * stale, or, for a write lease, when the file's size or ctime differ from when it was mapped,
+ * which finds writes through the descriptor holding it. Otherwise it maps the file again with
+ * FIEMAP and returns -ESTALE when the extents differ, which finds changes that break no lease, at
+ * the cost of a FIEMAP per release, see README.md. xal_opts.lease_no_recheck leaves it out. After
+ * -ESTALE the file is mapped again on a later xal_extents_acquire(). Not seen: a mapping that
+ * changed and changed back, writes to the block device, and a break that xal's thread has not
+ * taken yet; when /proc/self/fdinfo cannot be read, as without /proc, one taken more than 250 ms
+ * after the kernel issued it, with lease-break-time as last read, 45 s if never. In other watch
+ * modes this does nothing.
  *
  * @param xal The xal struct obtained when opened with xal_open() or xal_open_from_uri()
  * @param inode The inode passed to xal_extents_acquire()
@@ -758,9 +761,49 @@ xal_extents_acquire(struct xal *xal, struct xal_inode *inode, struct xal_extents
 int
 xal_extents_release(struct xal *xal, struct xal_inode *inode);
 
+/**
+ * Hold a file's lease on the caller's descriptor of it, and map the file now
+ *
+ * XAL_WATCHMODE_READ_LEASE only. For a caller that opens its files and registers them before
+ * reading, as cuFile-like callers do: the open(), F_SETLEASE and first FIEMAP leave the first
+ * xal_extents_acquire(). xal takes a read lease when fd is open read-only and a write lease
+ * otherwise, takes over fd's F_SETSIG and owner for the break, takes the lease again on fd after a
+ * break, and never closes fd. xal_index() and xal_close() release every attachment and leave the
+ * descriptors open.
+ *
+ * fd must stay open, and name that file, until xal_extents_detach_fd(), xal_index() or
+ * xal_close(), and its open file may be attached once. A write lease breaks on any other open() of
+ * the file, so a thread holding the extents must not open the file itself. Writes through fd break
+ * nothing; the next xal_extents_release() returns -ESTALE when the file's size or ctime changed.
+ * README.md has the details.
+ *
+ * @param xal The xal struct obtained when opened with xal_open() or xal_open_from_uri()
+ * @param inode A regular file in the index
+ * @param fd The caller's descriptor of that file
+ * @param attached Set to the inode to pass for the attached file afterwards, which is inode; may be
+ *        NULL
+ *
+ * @return On success, 0. -EAGAIN when the lease cannot be taken now, where a retry may succeed;
+ * -EBUSY when the file has readers, is being mapped, dropped or revoked, or is attached, or fd is
+ * attached already; -EINVAL when the handle is not in XAL_WATCHMODE_READ_LEASE or fd is not the
+ * file's; -ECHILD in a forked child; other negative errno as xal_extents_acquire().
+ */
+int
+xal_extents_attach_fd(struct xal *xal, struct xal_inode *inode, int fd,
+		      struct xal_inode **attached);
+
+/**
+ * Release the lease xal_extents_attach_fd() took, and leave fd open
+ *
+ * @return On success, 0. -EBUSY while the file has readers or is being mapped, dropped or revoked,
+ * -EINVAL when it is not attached, -ECHILD in a forked child.
+ */
+int
+xal_extents_detach_fd(struct xal *xal, struct xal_inode *inode);
+
 struct xal_lease_stats {
 	uint64_t mapped;  ///< Files mapped under a lease, counting re-maps
-	uint64_t refused; ///< Lease attempts refused because the file was open for writing
+	uint64_t refused; ///< Refused leases: open for writing, or, for a write lease, elsewhere
 	uint64_t breaks;  ///< Lease-break notifications received
 	uint64_t revoked; ///< Leases released after a break, or after a release found them stale
 	uint64_t rescans; ///< Times every lease was checked because notifications were lost
