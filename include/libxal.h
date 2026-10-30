@@ -113,6 +113,13 @@ struct xal_opts {
 	 *  then hands out the old extents until the lease is broken or dropped. See
 	 *  xal_extents_release(). */
 	int lease_no_recheck;
+
+	/** XAL_WATCHMODE_READ_LEASE only: how many files to keep under a lease. Past it, xal drops
+	 *  the lease of a file without readers that was not acquired since the last pass; it is
+	 *  exceeded while every leased file has readers, and briefly by files being mapped at the
+	 *  same time. 0 for half the soft RLIMIT_NOFILE at xal_open(), or no limit when that is
+	 *  unlimited. */
+	uint32_t lease_max;
 };
 
 /**
@@ -719,9 +726,9 @@ xal_get_extents(struct xal *xal, char *path, struct xal_extents **extents);
  * @param extents Set to the file's extents on success
  *
  * @return On success, 0. -EAGAIN when the file is open for writing or its lease is being
- * recalled, -ESTALE when the indexed path now names another file, -EMFILE when the process is out
- * of descriptors, as every mapped file holds one, -ECHILD in a forked child, other negative errno
- * on error.
+ * recalled, -ESTALE when the indexed path now names another file, -EMFILE when xal is out of
+ * descriptors and every file holding one has readers, -ECHILD in a forked child, other negative
+ * errno on error.
  */
 int
 xal_extents_acquire(struct xal *xal, struct xal_inode *inode, struct xal_extents **extents);
@@ -758,6 +765,7 @@ struct xal_lease_stats {
 	uint64_t revoked; ///< Leases released after a break, or after a release found them stale
 	uint64_t rescans; ///< Times every lease was checked because notifications were lost
 	uint64_t stale;	  ///< Releases that found the extents may no longer hold the file's data
+	uint64_t evicted; ///< Leases dropped on files without readers, to stay within lease_max
 };
 
 /**

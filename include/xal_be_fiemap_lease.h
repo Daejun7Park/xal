@@ -14,9 +14,10 @@
  *
  * UNMAPPED -> MAPPING -> VALID on the first xal_extents_acquire(). VALID -> REVOKING when the
  * kernel breaks the lease or a release finds the extents stale, and REVOKING -> REVOKED once the
- * last reader has released and the lease is dropped. REFUSED marks a file that was open for
- * writing when a lease was attempted. REVOKED and REFUSED files are mapped again by the next
- * xal_extents_acquire() that can take a lease.
+ * last reader has released and the lease is dropped. VALID -> EVICTING -> UNMAPPED when xal drops
+ * the lease of a file without readers to stay within lease_max, or back to VALID if a reader came
+ * meanwhile. REFUSED marks a file that was open for writing when a lease was attempted. REVOKED
+ * and REFUSED files are mapped again by the next xal_extents_acquire() that can take a lease.
  */
 enum xal_lease_state {
 	XAL_LEASE_UNMAPPED = 0,
@@ -25,6 +26,7 @@ enum xal_lease_state {
 	XAL_LEASE_REVOKING = 3,
 	XAL_LEASE_REVOKED = 4,
 	XAL_LEASE_REFUSED = 5,
+	XAL_LEASE_EVICTING = 6,
 };
 
 struct xal_lease_entry {
@@ -35,6 +37,8 @@ struct xal_lease_entry {
 	_Atomic uint64_t expire_ns; ///< CLOCK_MONOTONIC time from which a broken lease may have
 				    ///< timed out; 0 when it cannot, or after a stale release
 	atomic_bool stale;	    ///< A release found the extents may no longer hold the data
+	atomic_bool ref;	    ///< Acquired since the eviction hand last passed
+	uint32_t slot;		    ///< Position in held[] while fd is open
 };
 
 KHASH_MAP_INIT_INT(fd_to_idx, uint32_t)
@@ -46,7 +50,15 @@ struct xal_lease_set {
 	struct xal_lease_entry *entries; ///< Indexed like the inode pool
 	size_t nentries;
 	kh_fd_to_idx_t *fd_map; ///< Lease fd to inode index, for the break notification
-	pthread_mutex_t lock;	///< Guards fd_map, the extents pool and publishing a mapping
+	uint32_t *held;		///< Entries holding a lease fd, in no order
+	uint32_t nheld;
+	uint32_t held_cap;
+	uint32_t max_held; ///< Past it, the lease of a file without readers is dropped
+	uint32_t hand;	   ///< Next position in held[] the eviction looks at
+	int *dead;	   ///< Lease fds dropped under lock, closed by lease_unlock()
+	uint32_t ndead;
+	uint32_t dead_cap;
+	pthread_mutex_t lock; ///< Guards fd_map, held[], the extents pool and publishing a mapping
 	struct xal_lease_stats stats;
 	struct xal_lease_set *next; ///< In the process-wide list of sets
 	bool recheck;		    ///< !xal_opts.lease_no_recheck
