@@ -133,7 +133,9 @@ nothing to the filesystem itself. It needs:
 * one file descriptor per mapped file, so `RLIMIT_NOFILE` bounds how many
   files can be held at once
 * readers to release within `/proc/sys/fs/lease-break-time` seconds, after
-  which the kernel lets a waiting writer through anyway
+  which the kernel lets a waiting writer through anyway; a later
+  `xal_extents_release()` returns `-ESTALE` once xal's thread has taken the
+  break
 * the caller not to use `SIGRTMIN+7`, nor to rely on `SIGIO` sent to the
   process, while a handle in this mode is open
 
@@ -153,10 +155,19 @@ from a signal handler while a handle in this mode is open. A file being
 mapped at `fork()` stays open in the child, even after `xal_close()` there,
 until it exits or execs.
 
-It does not support `shm_name`, and it does not see changes that do not open
-the file for writing: a dedupe through a read-only descriptor, data moved by
-the filesystem itself as zoned XFS garbage collection does, or writes to the
-block device. See `xal_extents_acquire()` in `include/libxal.h`.
+`xal_extents_release()` returns `-ESTALE` when the kernel has let a writer
+past the broken lease, so the caller knows to drop what it read. Changes that
+do not open the file for writing do not wait for readers: a dedupe through a
+read-only descriptor, or data moved by the filesystem itself as zoned XFS
+garbage collection does. The release therefore also maps the file again and
+returns `-ESTALE` when its extents changed, at the cost of a FIEMAP per
+release; on XFS, releases of files that have ever shared blocks, as copies
+made by `cp --reflink` have, also wait for each other on the allocation
+group. `xal_opts.lease_no_recheck` leaves the FIEMAP out. Writes to the block
+device itself are not seen.
+
+It does not support `shm_name`. See `xal_extents_acquire()` and
+`xal_extents_release()` in `include/libxal.h`.
 
 #### File lookup modes
 

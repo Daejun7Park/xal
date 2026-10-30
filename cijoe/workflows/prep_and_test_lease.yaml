@@ -20,6 +20,7 @@ steps:
   with:
     dev-path: '{{ config.xal.dev_path }}'
     mountpoint: '{{ config.xal.mountpoint }}'
+    reflink: true
 
 - name: prep_files
   uses: prep_files

@@ -15,11 +15,15 @@ from pathlib import Path
 import pytest
 
 READY_RE = re.compile(r"LEASE_READY pid=(\d+) byte=(\d+) extents=(\d+)")
+RELEASED_RE = re.compile(r"RELEASED err=(-?\d+)")
 REACQUIRED_RE = re.compile(r"REACQUIRED byte=(\d+) extents=(\d+)")
 EXTENT_RE = re.compile(r"EXTENT 0 byte=(\d+) bytes=(\d+) flag=0x([0-9a-f]+)")
 
 XAL_EXTENT_SHARED = 0x2  # enum xal_extent_flag
+FMR_OWN_FREE = "special_0:1"
+EINVAL = 22
 ENOTSUP = 95
+ESTALE = 116
 
 
 @pytest.fixture(autouse=True)
@@ -164,6 +168,7 @@ def _writer_waits_for_reader(cijoe, name, option=""):
         cijoe.run(f"sudo kill -USR1 {pid}")
         took = int(_wait_for(writer, TOOK_RE, 10).group(1))
         assert took >= 900, f"writer took {took} ms, less than the 1 s the extents were held"
+        assert int(_wait_for(log, RELEASED_RE, 10).group(1)) == 0, "held extents reported stale"
 
         m = _wait_for(log, REACQUIRED_RE, 30)
         assert _raw(cijoe, dev_path, int(m.group(1)), 1) == "B", "remapped extent lacks the write"
@@ -277,6 +282,7 @@ def test_lease_reports_unwritten(cijoe):
     assert int(m.group(3), 16) == 0, f"written extent with a flag:\n{out}"
     m1 = re.search(r"EXTENT 1 byte=\d+ bytes=\d+ flag=0x([0-9a-f]+)", out)
     assert m1 and int(m1.group(1), 16) & 0x01, f"unwritten extent without the flag:\n{out}"
+    assert "RELEASE err=0" in out, out
     assert _raw(cijoe, dev_path, int(m.group(1))) == "DDDD", out
 
     cijoe.run(f"rm -f {path}")
@@ -328,6 +334,178 @@ def test_lease_orphan_child_keeps_no_lease(cijoe):
         cijoe.run(f"sudo kill -KILL {m.group(1)}")
 
     cijoe.run(f"rm -f {path}")
+
+
+def test_lease_release_without_acquire(cijoe):
+    """A release of a file that has no reader left is refused."""
+
+    dev_path, mountpoint = _require_fixture(cijoe)
+    path = f"{mountpoint}/xal_lease_release_twice"
+    _fill(cijoe, path, "A", 4096)
+
+    out = _probe(cijoe, dev_path, mountpoint, path)
+    assert "ACQUIRE err=0" in out, out
+    assert "RELEASE err=0" in out, out
+    assert f"RELEASE_AGAIN err=-{EINVAL}" in out, out
+
+    cijoe.run(f"rm -f {path}")
+
+
+def _owners(cijoe, mountpoint, byte, nbytes) -> set:
+    """Owners GETFSMAP reports for the device byte range: inode_<ino>_data, FMR_OWN_FREE for free
+    space, and so on."""
+
+    out = _capture(cijoe, f"sudo xfs_io -c 'fsmap -d -m' {mountpoint}")
+    lo, hi = byte // 512, (byte + nbytes) // 512 - 1
+    owners = set()
+    for line in out.splitlines():
+        f = line.split(",")
+        if len(f) > 5 and f[3].isdigit() and int(f[3]) <= hi and lo <= int(f[4]):
+            owners.add(f[5])
+    return owners
+
+
+def test_lease_release_stale_after_dedupe(cijoe):
+    """A dedupe into the held file through a read-only descriptor breaks no lease, but moves the
+    file to other blocks and frees the old ones, so the release says the extents may no longer
+    hold its data."""
+
+    dev_path, mountpoint = _require_fixture(cijoe)
+    held, twin = f"{mountpoint}/xal_lease_dedupe", f"{mountpoint}/xal_lease_twin"
+    _fill(cijoe, held, "E", 65536)
+    _fill(cijoe, twin, "E", 65536)
+
+    pid, byte, log = _start_hold(cijoe, dev_path, mountpoint, held)
+    try:
+        out = _capture(cijoe, f"sudo xfs_io -r -c 'dedupe {twin} 0 0 65536' {held}")
+        assert "deduped 65536/65536" in out, f"dedupe did not go through:\n{out}"
+        owners = _owners(cijoe, mountpoint, byte, 65536)
+        if any(o.startswith("inode_") for o in owners) or FMR_OWN_FREE in owners:
+            assert FMR_OWN_FREE in owners, f"the held blocks were not freed: {owners}"
+
+        cijoe.run(f"sudo kill -USR1 {pid}")
+        err = int(_wait_for(log, RELEASED_RE, 10).group(1))
+        assert err == -ESTALE, f"release returned {err} after the file was deduped"
+
+        m = _wait_for(log, REACQUIRED_RE, 30)
+        assert int(m.group(1)) != byte, "the file was not mapped again after the dedupe"
+        assert _raw(cijoe, dev_path, int(m.group(1))) == "EEEE", "remapped extent lacks the data"
+    finally:
+        _stop_hold(cijoe, pid)
+
+    cijoe.run(f"rm -f {held} {twin}")
+
+
+def test_lease_release_misses_dedupe_with_no_recheck(cijoe):
+    """With lease_no_recheck the release does not map the file again, so it does not see the
+    dedupe that test_lease_release_stale_after_dedupe finds, and the next acquire hands out the
+    old extents."""
+
+    dev_path, mountpoint = _require_fixture(cijoe)
+    held, twin = f"{mountpoint}/xal_lease_dedupe_nr", f"{mountpoint}/xal_lease_twin_nr"
+    _fill(cijoe, held, "E", 65536)
+    _fill(cijoe, twin, "E", 65536)
+
+    pid, byte, log = _start_hold(cijoe, dev_path, mountpoint, held, "--no-recheck")
+    try:
+        out = _capture(cijoe, f"sudo xfs_io -r -c 'dedupe {twin} 0 0 65536' {held}")
+        assert "deduped 65536/65536" in out, f"dedupe did not go through:\n{out}"
+        owners = _owners(cijoe, mountpoint, byte, 65536)
+        if any(o.startswith("inode_") for o in owners) or FMR_OWN_FREE in owners:
+            assert FMR_OWN_FREE in owners, f"the held blocks were not freed: {owners}"
+
+        cijoe.run(f"sudo kill -USR1 {pid}")
+        err = int(_wait_for(log, RELEASED_RE, 10).group(1))
+        assert err == 0, f"release returned {err} with lease_no_recheck"
+        m = _wait_for(log, REACQUIRED_RE, 30)
+        assert int(m.group(1)) == byte, "the next acquire did not hand out the old extents"
+    finally:
+        _stop_hold(cijoe, pid)
+
+    cijoe.run(f"rm -f {held} {twin}")
+
+
+def test_lease_release_stale_after_break_time(cijoe):
+    """Past lease-break-time the kernel lets a writer through while the extents are held, so the
+    release says they may no longer hold the file's data."""
+
+    dev_path, mountpoint = _require_fixture(cijoe)
+    path = f"{mountpoint}/xal_lease_timeout"
+    _fill(cijoe, path, "A", 4096)
+
+    cijoe.run("sudo sysctl -qw fs.lease-break-time=1")
+    pid, byte, log = _start_hold(cijoe, dev_path, mountpoint, path)
+    try:
+        writer = _timed(
+            cijoe, "lease_writer", f"printf B | dd of={path} conv=notrunc,fsync status=none"
+        )
+        took = int(_wait_for(writer, TOOK_RE, 10).group(1))
+        assert took < 5000, f"writer took {took} ms with a lease-break-time of 1 s"
+        assert _raw(cijoe, dev_path, byte, 1) == "B", "the writer did not reach the held extent"
+
+        cijoe.run(f"sudo kill -USR1 {pid}")
+        err = int(_wait_for(log, RELEASED_RE, 10).group(1))
+        assert err == -ESTALE, f"release returned {err} after the writer was let through"
+    finally:
+        _stop_hold(cijoe, pid)
+
+    cijoe.run(f"rm -f {path}")
+
+
+def test_lease_release_stale_when_break_seen_late(cijoe):
+    """A break that reaches xal only after the kernel let the writer through is still reported:
+    the kernel no longer lists the lease, although lease-break-time has not run out since xal saw
+    the break. The holder is stopped meanwhile, so the break waits in its signal queue; the
+    release comes well within the 3 s xal then counts from the break."""
+
+    dev_path, mountpoint = _require_fixture(cijoe)
+    path = f"{mountpoint}/xal_lease_late"
+    _fill(cijoe, path, "A", 4096)
+
+    cijoe.run("sudo sysctl -qw fs.lease-break-time=3")
+    pid, _, log = _start_hold(cijoe, dev_path, mountpoint, path)
+    try:
+        cijoe.run(f"sudo kill -STOP {pid}")
+        writer = _timed(
+            cijoe, "lease_writer", f"printf B | dd of={path} conv=notrunc,fsync status=none"
+        )
+        _wait_for(writer, TOOK_RE, 10)
+        cijoe.run(f"sudo kill -CONT {pid}")
+        time.sleep(0.2)
+
+        cijoe.run(f"sudo kill -USR1 {pid}")
+        err = int(_wait_for(log, RELEASED_RE, 10).group(1))
+        assert err == -ESTALE, f"release returned {err} after a break seen late"
+    finally:
+        cijoe.run(f"sudo kill -CONT {pid}")
+        _stop_hold(cijoe, pid)
+
+    cijoe.run(f"rm -f {path}")
+
+
+def test_lease_recheck_ignores_shared_split(cijoe):
+    """Cloning part of the held file into another file breaks no lease and moves no data, but
+    XFS then reports the held file's mapping split where it is shared, which the recheck must not
+    take for a change."""
+
+    dev_path, mountpoint = _require_fixture(cijoe)
+    held, other = f"{mountpoint}/xal_lease_split", f"{mountpoint}/xal_lease_split_clone"
+    _fill(cijoe, held, "E", 65536)
+
+    pid, _, log = _start_hold(cijoe, dev_path, mountpoint, held)
+    try:
+        out = _capture(cijoe, f"sudo xfs_io -f -c 'reflink {held} 0 0 4096' {other}")
+        assert "linked 4096/4096" in out, f"reflink did not go through:\n{out}"
+        out = _capture(cijoe, f"sudo xfs_io -r -c 'fiemap' {held}")
+        assert len(re.findall(r"^\s*\d+:", out, re.M)) >= 2, f"FIEMAP did not split:\n{out}"
+
+        cijoe.run(f"sudo kill -USR1 {pid}")
+        err = int(_wait_for(log, RELEASED_RE, 10).group(1))
+        assert err == 0, f"release returned {err} although no data moved"
+    finally:
+        _stop_hold(cijoe, pid)
+
+    cijoe.run(f"sudo rm -f {held} {other}")
 
 
 def test_lease_rejects_shm(cijoe):

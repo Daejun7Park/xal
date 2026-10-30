@@ -10,6 +10,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -26,10 +27,62 @@
 /** Offset from SIGRTMIN of the signal set with F_SETSIG on every lease fd */
 #define XAL_LEASE_SIGOFF 7
 
+/** Taken off lease-break-time for the time a break takes to reach xal's thread */
+#define XAL_LEASE_EXPIRE_MARGIN_NS (250ULL * 1000 * 1000)
+
 static const struct timespec lease_nap = {.tv_sec = 0, .tv_nsec = 20 * 1000};
 
 /** Longest wait between looks at a file another thread maps, which writes its dirty data back */
 #define XAL_LEASE_NAP_MAX_NS (1000 * 1000)
+
+static uint64_t
+now_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+
+	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+/* The last /proc/sys/fs/lease-break-time read, for when it cannot be, as with no fd free */
+static atomic_long lease_break_secs = 45;
+
+static long
+lease_break_time(void)
+{
+	FILE *f = fopen("/proc/sys/fs/lease-break-time", "re");
+	long secs;
+
+	if (f) {
+		if (fscanf(f, "%ld", &secs) == 1) {
+			atomic_store(&lease_break_secs, secs);
+		}
+		fclose(f);
+	}
+
+	return atomic_load(&lease_break_secs);
+}
+
+/*
+ * When a lease broken now may have timed out: past /proc/sys/fs/lease-break-time seconds the
+ * kernel lets the breaker through even with readers left. 0 when it never does, as with a
+ * lease-break-time of 0 or less.
+ */
+static uint64_t
+lease_expire_ns(void)
+{
+	uint64_t now = now_ns(), wait;
+	long secs = lease_break_time();
+
+	if (secs <= 0) {
+		return 0;
+	}
+
+	wait = (uint64_t)secs * 1000000000ULL;
+
+	return now + (wait > XAL_LEASE_EXPIRE_MARGIN_NS ? wait - XAL_LEASE_EXPIRE_MARGIN_NS : 0);
+}
 
 /*
  * A broken lease is reported with a signal to the file's owner, which xal sets to one thread of
@@ -160,6 +213,32 @@ ext_vec_push(struct ext_vec *vec, const struct fiemap_extent *fe, uint32_t block
 	return 0;
 }
 
+/*
+ * Joins extents that follow on in the file and on disk and differ at most in XAL_EXTENT_SHARED,
+ * in place, and returns how many are left. XFS splits a mapping where another file shares part of
+ * it, though the data has not moved, so two mappings are compared joined.
+ */
+static uint32_t
+ext_join(struct xal_extent *v, uint32_t n)
+{
+	uint32_t out = 0;
+
+	for (uint32_t i = 0; i < n; ++i) {
+		struct xal_extent *prev = out ? &v[out - 1] : NULL;
+
+		if (prev && prev->start_offset + prev->nblocks == v[i].start_offset &&
+		    prev->start_block + prev->nblocks == v[i].start_block &&
+		    !((prev->flag | v[i].flag) & XAL_EXTENT_NOADDR) &&
+		    !((prev->flag ^ v[i].flag) & ~XAL_EXTENT_SHARED)) {
+			prev->nblocks += v[i].nblocks;
+			continue;
+		}
+		v[out++] = v[i];
+	}
+
+	return out;
+}
+
 /* Called with ls->lock held */
 static void
 lease_drop(struct xal_lease_set *ls, struct xal_lease_entry *e)
@@ -203,22 +282,31 @@ lease_finish_revoke(struct xal_lease_set *ls, uint32_t idx)
 	ls->stats.revoked++;
 }
 
-/* Called with ls->lock held */
+/*
+ * Called with ls->lock held, under which a VALID entry stays VALID. expire_ns is from
+ * lease_expire_ns(), or 0 when the lease is not being broken.
+ */
 static void
-lease_revoke(struct xal_lease_set *ls, uint32_t idx)
+lease_revoke(struct xal_lease_set *ls, uint32_t idx, uint64_t expire_ns)
 {
+	struct xal_lease_entry *e = &ls->entries[idx];
 	int expected = XAL_LEASE_VALID;
 
+	if (atomic_load(&e->state) != XAL_LEASE_VALID) {
+		return;
+	}
+	/* Set first, so that a reader that sees REVOKING sees when it may time out */
+	atomic_store(&e->expire_ns, expire_ns);
+
 	/* Pairs with xal_extents_acquire(): readers that see REVOKING back out. */
-	if (atomic_compare_exchange_strong(&ls->entries[idx].state, &expected,
-					   XAL_LEASE_REVOKING)) {
+	if (atomic_compare_exchange_strong(&e->state, &expected, XAL_LEASE_REVOKING)) {
 		lease_finish_revoke(ls, idx);
 	}
 }
 
 /* Revoke the lease held on fd, if this set holds it */
 static bool
-lease_break(struct xal_lease_set *ls, int fd)
+lease_break(struct xal_lease_set *ls, int fd, uint64_t expire_ns)
 {
 	khiter_t it;
 	bool found;
@@ -228,15 +316,16 @@ lease_break(struct xal_lease_set *ls, int fd)
 	found = it != kh_end(ls->fd_map);
 	if (found) {
 		ls->stats.breaks++;
-		lease_revoke(ls, kh_val(ls->fd_map, it));
+		lease_revoke(ls, kh_val(ls->fd_map, it), expire_ns);
 	}
 	pthread_mutex_unlock(&ls->lock);
 
 	return found;
 }
 
+/* The kernel sends SIGIO when it cannot queue a break's signal, so about when it broke */
 static void
-lease_rescan(struct xal_lease_set *ls)
+lease_rescan(struct xal_lease_set *ls, uint64_t expire_ns)
 {
 	pthread_mutex_lock(&ls->lock);
 	ls->stats.rescans++;
@@ -247,7 +336,7 @@ lease_rescan(struct xal_lease_set *ls)
 		/* A lease being broken reports the type it is breaking to, F_UNLCK here. */
 		if (e->fd >= 0 && atomic_load(&e->state) == XAL_LEASE_VALID &&
 		    fcntl(e->fd, F_GETLEASE) != F_RDLCK) {
-			lease_revoke(ls, i);
+			lease_revoke(ls, i, expire_ns);
 		}
 	}
 
@@ -261,13 +350,14 @@ lease_rescan(struct xal_lease_set *ls)
 static void
 lease_dispatch(int fd)
 {
+	uint64_t expire_ns = lease_expire_ns();
 	struct xal_lease_set *ls;
 
 	pthread_mutex_lock(&lease_proc.lock);
 	for (ls = lease_proc.sets; ls; ls = ls->next) {
 		if (fd < 0) {
-			lease_rescan(ls);
-		} else if (lease_break(ls, fd)) {
+			lease_rescan(ls, expire_ns);
+		} else if (lease_break(ls, fd, expire_ns)) {
 			break;
 		}
 	}
@@ -402,20 +492,22 @@ lease_proc_unregister(struct xal_lease_set *ls)
 }
 
 /*
- * The first call flushes as read_fiemap() does, see fiemap_ioctl(). Extents past EOF, such as
- * speculative preallocation, are left out or cut at the block holding EOF.
+ * With sync, the first call flushes as read_fiemap() does, see fiemap_ioctl(). Extents past EOF,
+ * such as speculative preallocation, are left out or cut at the block holding EOF.
  */
 static int
-map_fiemap(int fd, uint64_t size, uint32_t blocksize, struct ext_vec *vec)
+map_fiemap(int fd, uint64_t size, uint32_t blocksize, bool sync, struct ext_vec *vec)
 {
 	struct fiemap *fm;
 	uint64_t start = 0;
 	int err = 0;
 
-	fm = calloc(1, sizeof(*fm) + XAL_FIEMAP_BATCH * sizeof(struct fiemap_extent));
+	/* The kernel reads only the header, and every release with recheck calls this */
+	fm = malloc(sizeof(*fm) + XAL_FIEMAP_BATCH * sizeof(struct fiemap_extent));
 	if (!fm) {
 		return -ENOMEM;
 	}
+	memset(fm, 0, sizeof(*fm));
 
 	while (start < size) {
 		struct fiemap_extent *last;
@@ -425,7 +517,7 @@ map_fiemap(int fd, uint64_t size, uint32_t blocksize, struct ext_vec *vec)
 		fm->fm_extent_count = XAL_FIEMAP_BATCH;
 		fm->fm_mapped_extents = 0;
 
-		err = fiemap_ioctl(fd, fm, start == 0);
+		err = fiemap_ioctl(fd, fm, sync && start == 0);
 		if (err) {
 			break;
 		}
@@ -516,7 +608,7 @@ lease_and_map(struct xal_lease_set *ls, struct xal_inode *inode, uint32_t idx)
 		goto failed_unlock;
 	}
 
-	err = map_fiemap(fd, st.st_size, ls->xal->sb.blocksize, &vec);
+	err = map_fiemap(fd, st.st_size, ls->xal->sb.blocksize, true, &vec);
 	if (err) {
 		goto failed_unlock;
 	}
@@ -564,6 +656,8 @@ lease_and_map(struct xal_lease_set *ls, struct xal_inode *inode, uint32_t idx)
 	inode->size = st.st_size;
 
 	e->fd = fd;
+	atomic_store(&e->expire_ns, 0);
+	atomic_store(&e->stale, false);
 	ls->stats.mapped++;
 	atomic_store(&e->state, XAL_LEASE_VALID);
 
@@ -588,6 +682,111 @@ lease_set(struct xal *xal)
 	struct xal_be_fiemap *be = (struct xal_be_fiemap *)&xal->be;
 
 	return be->base.type == XAL_BACKEND_FIEMAP ? be->lease : NULL;
+}
+
+/* Count one reader out; the last reader of a REVOKING entry drops its lease */
+static int
+lease_reader_put(struct xal_lease_set *ls, uint32_t idx)
+{
+	struct xal_lease_entry *e = &ls->entries[idx];
+	unsigned readers = atomic_load(&e->readers);
+
+	do {
+		if (!readers) {
+			XAL_DEBUG("FAILED: release without acquire; inode idx(%u)", idx);
+			return -EINVAL;
+		}
+	} while (!atomic_compare_exchange_weak(&e->readers, &readers, readers - 1));
+
+	if (readers == 1 && atomic_load(&e->state) == XAL_LEASE_REVOKING) {
+		pthread_mutex_lock(&ls->lock);
+		lease_finish_revoke(ls, idx);
+		pthread_mutex_unlock(&ls->lock);
+	}
+
+	return 0;
+}
+
+/*
+ * Whether the kernel still holds the lease on fd: 1 if so, 0 if not, negative errno if it cannot
+ * tell. A broken lease stays listed, as BREAKING, until the kernel lets the breaker through.
+ */
+static int
+lease_held(int fd)
+{
+	char path[64], line[256];
+	bool held = false;
+	FILE *f;
+
+	snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", fd);
+	f = fopen(path, "re");
+	if (!f) {
+		return -errno;
+	}
+	while (!held && fgets(line, sizeof(line), f)) {
+		held = !strncmp(line, "lock:", 5) && strstr(line, " LEASE ");
+	}
+	fclose(f);
+
+	return held;
+}
+
+/*
+ * Whether the extents handed to a reader may no longer hold the file's data: a release already
+ * found so, or the kernel has let a writer past the broken lease, or, with recheck, the file no
+ * longer maps as it did, as after a dedupe into it or the filesystem moving its data, which break
+ * no lease. Called by a reader, which keeps e->fd open and the extents in place.
+ */
+static int
+lease_check(struct xal_lease_set *ls, struct xal_inode *inode, struct xal_lease_entry *e)
+{
+	struct xal_extents *extents = &inode->content.extents;
+	struct ext_vec vec = {0};
+	uint64_t expire_ns;
+	struct xal_extent *old = NULL;
+	uint32_t nold;
+	int err;
+
+	if (atomic_load(&e->stale)) {
+		return -ESTALE;
+	}
+	if (atomic_load(&e->state) == XAL_LEASE_REVOKING) {
+		err = lease_held(e->fd);
+		expire_ns = atomic_load(&e->expire_ns);
+		if (!err || (err < 0 && expire_ns && now_ns() >= expire_ns)) {
+			return -ESTALE;
+		}
+	}
+	if (!ls->recheck) {
+		return 0;
+	}
+
+	err = map_fiemap(e->fd, inode->size, ls->xal->sb.blocksize, false, &vec);
+	if (!err) {
+		old = malloc((extents->count ? extents->count : 1) * sizeof(*old));
+		err = old ? 0 : -ENOMEM;
+	}
+	for (uint32_t i = 0; i < extents->count && !err; ++i) {
+		old[i] = *xal_extent_at(ls->xal, extents->extent_idx + i);
+	}
+	if (!err) {
+		nold = ext_join(old, extents->count);
+		vec.n = ext_join(vec.v, vec.n);
+		err = nold == vec.n ? 0 : -ESTALE;
+	}
+	for (uint32_t i = 0; i < vec.n && !err; ++i) {
+		/* Sharing changes with other files, as after a dedupe into one of them */
+		if (old[i].start_offset != vec.v[i].start_offset ||
+		    old[i].start_block != vec.v[i].start_block ||
+		    old[i].nblocks != vec.v[i].nblocks ||
+		    ((old[i].flag ^ vec.v[i].flag) & ~XAL_EXTENT_SHARED)) {
+			err = -ESTALE;
+		}
+	}
+	free(old);
+	free(vec.v);
+
+	return err;
 }
 
 int
@@ -626,7 +825,7 @@ xal_extents_acquire(struct xal *xal, struct xal_inode *inode, struct xal_extents
 			*extents = &inode->content.extents;
 			return 0;
 		}
-		xal_extents_release(xal, inode);
+		lease_reader_put(ls, idx);
 
 		state = atomic_load(&e->state);
 		switch (state) {
@@ -662,9 +861,8 @@ int
 xal_extents_release(struct xal *xal, struct xal_inode *inode)
 {
 	struct xal_lease_set *ls;
-	struct xal_lease_entry *e;
-	unsigned readers;
 	uint32_t idx;
+	int err, put;
 
 	if (!xal || !inode) {
 		return -EINVAL;
@@ -682,23 +880,26 @@ xal_extents_release(struct xal *xal, struct xal_inode *inode)
 	if (idx >= ls->nentries) {
 		return -EINVAL;
 	}
-	e = &ls->entries[idx];
+	if (!atomic_load(&ls->entries[idx].readers)) {
+		XAL_DEBUG("FAILED: release without acquire; inode idx(%u)", idx);
+		return -EINVAL;
+	}
 
-	readers = atomic_load(&e->readers);
-	do {
-		if (!readers) {
-			XAL_DEBUG("FAILED: release without acquire; inode idx(%u)", idx);
-			return -EINVAL;
-		}
-	} while (!atomic_compare_exchange_weak(&e->readers, &readers, readers - 1));
-
-	if (readers == 1 && atomic_load(&e->state) == XAL_LEASE_REVOKING) {
+	err = lease_check(ls, inode, &ls->entries[idx]);
+	if (err) {
 		pthread_mutex_lock(&ls->lock);
-		lease_finish_revoke(ls, idx);
+		if (err == -ESTALE) {
+			ls->stats.stale++;
+		}
+		/* Other readers are told too, and the next acquire maps the file again */
+		atomic_store(&ls->entries[idx].stale, true);
+		lease_revoke(ls, idx, 0);
 		pthread_mutex_unlock(&ls->lock);
 	}
 
-	return 0;
+	put = lease_reader_put(ls, idx);
+
+	return put ? put : err;
 }
 
 int
@@ -800,7 +1001,7 @@ xal_be_fiemap_lease_prepare(struct xal *xal)
 }
 
 int
-xal_be_fiemap_lease_init(struct xal *xal, const char *mountpoint)
+xal_be_fiemap_lease_init(struct xal *xal, const char *mountpoint, const struct xal_opts *opts)
 {
 	struct xal_be_fiemap *be = (struct xal_be_fiemap *)&xal->be;
 	struct xal_lease_set *ls;
@@ -818,6 +1019,8 @@ xal_be_fiemap_lease_init(struct xal *xal, const char *mountpoint)
 	ls->xal = xal;
 	ls->dev = st.st_dev;
 	ls->generation = lease_generation;
+	ls->recheck = !opts->lease_no_recheck;
+	lease_break_time();
 	pthread_mutex_init(&ls->lock, NULL);
 
 	ls->fd_map = kh_init(fd_to_idx);

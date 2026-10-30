@@ -107,6 +107,12 @@ struct xal_opts {
 	 *  Only files beneath it are indexed, and in XAL_WATCHMODE_REFLINK_SNAPSHOT only those
 	 *  are reflinked. NULL or empty indexes the whole mount. Ignored by the XFS backend. */
 	const char *subtree;
+
+	/** XAL_WATCHMODE_READ_LEASE only: if non-zero, xal_extents_release() does not map the file
+	 *  again with FIEMAP, and so misses the changes that break no lease; xal_extents_acquire()
+	 *  then hands out the old extents until the lease is broken or dropped. See
+	 *  xal_extents_release(). */
+	int lease_no_recheck;
 };
 
 /**
@@ -700,8 +706,9 @@ xal_get_extents(struct xal *xal, char *path, struct xal_extents **extents);
  * xal_extents_release(). A writer's open() or truncate() of the file breaks the lease; the writer
  * waits until the last reader has released, xal then releases the lease, and the next call maps
  * the file again. Between the two calls the extents therefore describe the file's blocks, unless a
- * writeback of the file failed, see xal_index(). In other watch modes this returns the indexed
- * extents and pins nothing. README.md lists what the mode needs and what it does not see.
+ * writeback of the file failed, see xal_index(), or xal_extents_release() returns an error. In
+ * other watch modes this returns the indexed extents and pins nothing. README.md lists what the
+ * mode needs and what it does not see.
  *
  * Every successful call must be paired with xal_extents_release() on the same inode. Neither may
  * run concurrently with xal_index() or xal_close() on the same handle, and xal_index() fails with
@@ -720,13 +727,26 @@ int
 xal_extents_acquire(struct xal *xal, struct xal_inode *inode, struct xal_extents **extents);
 
 /**
- * Count the caller out as a reader of a file's extents
+ * Count the caller out as a reader of a file's extents, and say whether they held its data
+ *
+ * Call it once every read or DMA through the extents has completed. With
+ * XAL_WATCHMODE_READ_LEASE it returns -ESTALE when the kernel has let a writer past the file's
+ * broken lease, as it does after lease-break-time, or when an earlier release found the extents
+ * stale. Otherwise it maps the file again with FIEMAP and returns -ESTALE when the extents differ,
+ * which finds changes that break no lease, at the cost of a FIEMAP per release, see README.md.
+ * xal_opts.lease_no_recheck leaves it out. After -ESTALE the file is mapped again on a later
+ * xal_extents_acquire(). Not seen: a mapping that changed and changed back, writes to the block
+ * device, and a break that xal's thread has not taken yet; when /proc/self/fdinfo cannot be read,
+ * as without /proc, one taken more than 250 ms after the kernel issued it, with lease-break-time
+ * as last read, 45 s if never. In other watch modes this does nothing.
  *
  * @param xal The xal struct obtained when opened with xal_open() or xal_open_from_uri()
  * @param inode The inode passed to xal_extents_acquire()
  *
- * @return On success, 0. -EINVAL when the file has no reader to count out, -ECHILD in a forked
- * child.
+ * @return On success, 0. -ESTALE when the data read through the extents may not be the file's,
+ * -EINVAL when the file has no reader to count out, -ECHILD in a forked child, other negative
+ * errno when the check could not be made. Except with -EINVAL and -ECHILD the caller is counted
+ * out, and on any error it must not trust what it read.
  */
 int
 xal_extents_release(struct xal *xal, struct xal_inode *inode);
@@ -735,8 +755,9 @@ struct xal_lease_stats {
 	uint64_t mapped;  ///< Files mapped under a lease, counting re-maps
 	uint64_t refused; ///< Lease attempts refused because the file was open for writing
 	uint64_t breaks;  ///< Lease-break notifications received
-	uint64_t revoked; ///< Leases released after a break
+	uint64_t revoked; ///< Leases released after a break, or after a release found them stale
 	uint64_t rescans; ///< Times every lease was checked because notifications were lost
+	uint64_t stale;	  ///< Releases that found the extents may no longer hold the file's data
 };
 
 /**
