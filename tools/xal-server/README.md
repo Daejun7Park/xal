@@ -30,7 +30,7 @@ devices = [
 ]
 
 [xal]
-# none = 0, reflink snapshot = 1. Nothing else is valid; see enum xal_watchmode.
+# none = 0, reflink snapshot = 1, read lease = 3. Nothing else is valid; see enum xal_watchmode.
 #
 #   none              nothing is watched and nothing is pinned. The published extents are a
 #                     snapshot of the filesystem as it was at index time and a foreign write can
@@ -39,6 +39,10 @@ devices = [
 #   reflink snapshot  every indexed file is cloned into a shadow directory, so the blocks stay
 #                     pinned and readers keep valid LBAs under foreign writes. Needs an XFS
 #                     mount made with reflink=1, and CAP_LINUX_IMMUTABLE to protect the clones.
+#   read lease        the index has names and no extents, and opens no file. A reader attaches
+#                     the files it opened with xal_extents_attach_fd() and takes their extents
+#                     from xal_extents_acquire(), under a lease of its own. xal_get_extents()
+#                     fails with -ENOTSUP. A reader marks the index dirty for new names.
 watchmode = 0
 ```
 
@@ -129,6 +133,10 @@ without reattaching, but a walk that raced the rewrite fails with `-ESTALE`; che
 `XAL_WATCHMODE_REFLINK_SNAPSHOT` also pins the blocks, so that only a re-index by this server can
 change what a reader sees. See `enum xal_watchmode` in `libxal.h` for the guarantee in
 full.
+
+With `read lease`, the index holds names only, and a reader leases the files it attaches; see
+`xal_extents_attach_fd()`. A re-index opens no file, so it breaks no reader's lease. Readers mark
+the index dirty as with `none` when they need new names.
 
 With `none`, nothing is watched: a reader that changed the filesystem itself, say by an
 allocating write, calls `xal_mark_dirty()` on its handle. The server polls for that mark every

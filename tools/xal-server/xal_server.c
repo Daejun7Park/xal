@@ -32,7 +32,7 @@ on_signal(int signo __attribute__((unused)))
 }
 
 /**
- * Per-device context for the watch callback, and for serve_marks() in XAL_WATCHMODE_NONE
+ * Per-device context for the watch callback, and for serve_marks() in the modes without a watch
  */
 struct xal_server_watch {
 	const struct xal_server_dev *dev;
@@ -79,11 +79,11 @@ on_dirty(struct xal *xal, void *cb_args)
 /**
  * Re-index each device a reader marked dirty, until one of 'signals' arrives
  *
- * In XAL_WATCHMODE_NONE nothing watches the filesystems: a reader that changed one marks the
- * index with xal_mark_dirty(), and this polls for that mark. The signals are blocked, so
- * sigtimedwait() takes one that arrived before the wait as well. A failed re-index leaves the
- * index dirty and is tried again after a wait that doubles on each failure; a failure is logged
- * as an error when its error differs from the last one's, and as debug otherwise.
+ * In XAL_WATCHMODE_NONE and XAL_WATCHMODE_READ_LEASE nothing watches the filesystems: a reader
+ * that changed one marks the index with xal_mark_dirty(), and this polls for that mark. The
+ * signals are blocked, so sigtimedwait() takes one that arrived before the wait as well. A failed
+ * re-index leaves the index dirty and is tried again after a wait that doubles on each failure; a
+ * failure is logged as an error when its error differs from the last one's, and as debug otherwise.
  */
 static void
 serve_marks(unsigned int nxals, struct xal **xals, struct xal_server_watch *watches,
@@ -170,7 +170,7 @@ publish(const struct xal_server_conf *conf, struct xal_server_watch *watch, stru
 
 	/* The clones keep a reader's extents valid; the watcher tells it the snapshot has gone
 	 * stale. */
-	if (conf->watch_mode) {
+	if (conf->watch_mode == XAL_WATCHMODE_REFLINK_SNAPSHOT) {
 		err = xal_watch_filesystem(xal, on_dirty, watch);
 		if (err) {
 			syslog(LOG_ERR, "FAILED: xal_watch_filesystem(%s); err(%d)", dev->uri, err);
@@ -178,7 +178,8 @@ publish(const struct xal_server_conf *conf, struct xal_server_watch *watch, stru
 		}
 	}
 
-	syslog(LOG_NOTICE, "published %s at shm_name(%s)", dev->uri, dev->shm_name);
+	syslog(LOG_NOTICE, "published %s at shm_name(%s), watchmode(%d)", dev->uri, dev->shm_name,
+	       conf->watch_mode);
 
 	*out = xal;
 
@@ -329,7 +330,7 @@ main(int argc, char **argv)
 
 	syslog(LOG_NOTICE, "serving %u device(s)", conf.ndevs);
 
-	if (conf.watch_mode == XAL_WATCHMODE_NONE) {
+	if (conf.watch_mode != XAL_WATCHMODE_REFLINK_SNAPSHOT) {
 		serve_marks(npublished, xals, watches, &block);
 	} else {
 		/* An explicitly empty mask rather than the one inherited at startup: a parent that
