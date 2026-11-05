@@ -59,4 +59,15 @@ xal_test_lease_server_exe = executable(
   install: true,
 )
 
+# A reader of an xal-server index in XAL_WATCHMODE_READ_LEASE with its own lease_no_recheck.
+xal_test_lease_reader_recheck_exe = executable(
+  'xal_test_lease_reader_recheck',
+  'test_lease_reader_recheck.c',
+  dependencies: xallib_deps,
+  link_with: xal_library,
+  include_directories: include_dirs,
+  install_rpath: xallib_rpath,
+  install: true,
+)
+
 subdir('xal-server')

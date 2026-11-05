@@ -157,6 +157,41 @@ def test_read_lease_reindex_keeps_a_readers_write_lease(cijoe):
         cijoe.run(f"rm -f {path} {path2} {path2}.small")
 
 
+def test_read_lease_reader_sets_no_recheck(cijoe):
+    """A reader of a XAL_WATCHMODE_READ_LEASE region passes xal_opts.lease_no_recheck to
+    xal_from_shm_opts(): a dedupe into a file it holds breaks no lease, and the release finds it
+    with the recheck and misses it without."""
+
+    dev_path, mountpoint = _require_mount(cijoe)
+    path, src = f"{mountpoint}/xal_server_recheck", f"{mountpoint}/xal_server_recheck_src"
+
+    err, _ = cijoe.run(
+        f"rm -f {path} {src} && xfs_io -f -c 'pwrite -S 0x41 0 64k' -c fsync {path}"
+        f" && xfs_io -f -c 'pwrite -S 0x41 0 64k' -c fsync {src}"
+    )
+    assert not err
+    # xfs_io exits 0 when the dedupe fails, and prints the error instead of the count
+    out = _capture(cijoe, f"xfs_io -r -c 'dedupe {src} 0 0 4k' {path}")
+    if "deduped 4096/4096" not in out:
+        cijoe.run(f"rm -f {path} {src}")
+        pytest.skip(f"the filesystem does not dedupe: {out.strip()}")
+    pid = _start_server(cijoe, dev_path, mountpoint, watchmode=XAL_WATCHMODE_READ_LEASE)
+    try:
+        for no_recheck in (0, 1):
+            # Fresh blocks for src, so that the dedupe changes the held file's mapping
+            err, _ = cijoe.run(f"rm -f {src} && xfs_io -f -c 'pwrite -S 0x41 0 64k' -c fsync {src}")
+            assert not err
+            out = _artifacts(cijoe) / f"lease_reader_recheck{no_recheck}.out"
+            err, _ = cijoe.run(
+                f"xal_test_lease_reader_recheck {SHM_NAME} {path} {src} 5000 {no_recheck}"
+                f" > {out} 2>&1"
+            )
+            assert not err, out.read_text()
+    finally:
+        _stop_server(cijoe, pid)
+        cijoe.run(f"rm -f {path} {src}")
+
+
 def test_none_refuses_an_attach(cijoe):
     """In XAL_WATCHMODE_NONE, whose re-index opens every file and so breaks a lease, a reader's
     attach is refused."""
