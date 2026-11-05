@@ -1395,7 +1395,7 @@ static int
 lease_shadow_open(struct xal *xal)
 {
 	struct xal_be_fiemap *be = (struct xal_be_fiemap *)&xal->be, *sbe;
-	struct xal_opts opts = {0};
+	struct xal_opts opts = {.lease_no_recheck = xal->reader_lease_no_recheck};
 	struct xal_lease_set *ls;
 	struct xal *sh;
 	uint32_t first;

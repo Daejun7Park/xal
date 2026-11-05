@@ -95,6 +95,10 @@ struct xal {
 	 * extents xal_extent_at() finds at XAL_EXTENT_SHADOW_BASE and above; the shadow points at
 	 * itself. NULL otherwise. */
 	_Atomic(struct xal *) shadow;
+
+	/* A secondary's xal_opts.lease_no_recheck from xal_from_shm_opts(), for the shadow its
+	 * first attach opens. 0 otherwise. */
+	int reader_lease_no_recheck;
 };
 
 #define XAL_EXTENT_SHADOW_BASE (1U << 31) ///< Extent indices from here are in xal->shadow's pool

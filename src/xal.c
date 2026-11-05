@@ -573,6 +573,12 @@ xal_get_sb_blocksize(struct xal *xal)
 int
 xal_from_shm(const char *shm_name, struct xal **out)
 {
+	return xal_from_shm_opts(shm_name, out, NULL);
+}
+
+int
+xal_from_shm_opts(const char *shm_name, struct xal **out, const struct xal_opts *opts)
+{
 	struct xal *xal;
 	struct xal_shared_state *state;
 	struct stat st;
@@ -588,6 +594,9 @@ xal_from_shm(const char *shm_name, struct xal **out)
 	}
 
 	xal->procrole = XAL_PROCROLE_SECONDARY;
+	if (opts) {
+		xal->reader_lease_no_recheck = opts->lease_no_recheck;
+	}
 
 	snprintf(shm_name_inodes, sizeof(shm_name_inodes), "%s_inodes", shm_name);
 	snprintf(shm_name_extents, sizeof(shm_name_extents), "%s_extents", shm_name);

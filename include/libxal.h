@@ -115,7 +115,8 @@ struct xal_opts {
 	/** XAL_WATCHMODE_READ_LEASE only: if non-zero, xal_extents_release() does not map the file
 	 *  again with FIEMAP, and so misses the changes that break no lease; xal_extents_acquire()
 	 *  then hands out the old extents until the lease is broken or dropped. See
-	 *  xal_extents_release(). */
+	 *  xal_extents_release(). A reader sets it for the files it attaches with
+	 *  xal_from_shm_opts(). */
 	int lease_no_recheck;
 
 	/** XAL_WATCHMODE_READ_LEASE only: how many files to keep under a lease. Past it, xal drops
@@ -600,6 +601,23 @@ int
 xal_from_shm(const char *shm_name, struct xal **out);
 
 /**
+ * xal_from_shm() with options for the files this reader attaches
+ *
+ * Of opts, only lease_no_recheck is read. On a region published in XAL_WATCHMODE_READ_LEASE it
+ * applies to the files this reader attaches with xal_extents_attach_fd(), as a primary's applies
+ * to its leases; on a region in another mode it is ignored. NULL opts is xal_from_shm(). The
+ * handle it returns is a handle from xal_from_shm() wherever this header names one.
+ *
+ * @param shm_name     Base name for the shared memory regions, the primary's opts->shm_name
+ * @param out          Output pointer for the constructed xal
+ * @param opts         Options for the attached files, or NULL
+ *
+ * @return As xal_from_shm()
+ */
+int
+xal_from_shm_opts(const char *shm_name, struct xal **out, const struct xal_opts *opts);
+
+/**
  * Print the path of the given inode to stdout
  *
  * The path is printed relative to the root of the indexed tree, that is, without the basepath
@@ -824,11 +842,11 @@ xal_extents_release(struct xal *xal, struct xal_inode *inode);
  * On a handle from xal_from_shm(), the file is attached to a handle private to this process, which
  * holds a copy of its inode and its extents, and *attached is that copy. Pass it to the other
  * xal_extents_*() calls; it stays valid until detached or xal_close(), however often the region is
- * indexed again, and xal_opts.lease_no_recheck cannot be set for it. A detached copy is not kept:
- * once all 65536 slots have been used, its slot goes to another file, and every call through the
- * copy then acts on that file. Up to 65536 files can be attached there at once. The first attach
- * starts xal's lease thread in this process, which takes SIGRTMIN+7 and SIGIO until xal_close(),
- * and a lease needs the file's owner or CAP_LEASE.
+ * indexed again, and its lease_no_recheck is the one xal_from_shm_opts() was given. A detached
+ * copy is not kept: once all 65536 slots have been used, its slot goes to another file, and every
+ * call through the copy then acts on that file. Up to 65536 files can be attached there at once.
+ * The first attach starts xal's lease thread in this process, which takes SIGRTMIN+7 and SIGIO
+ * until xal_close(), and a lease needs the file's owner or CAP_LEASE.
  *
  * @param xal The xal struct obtained when opened with xal_open(), xal_open_from_uri() or
  *        xal_from_shm()

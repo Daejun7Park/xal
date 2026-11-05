@@ -89,7 +89,8 @@ then.
 ## Reading an index
 
 A reader attaches with `xal_from_shm()` and gets a read-only handle supporting the full query API,
-except with `read lease`, whose index has no names.
+except with `read lease`, whose index has no names. A reader of a `read lease` index that wants
+`lease_no_recheck` for the files it attaches passes it to `xal_from_shm_opts()`.
 Everything else -- superblock, backend, mountpoint, root inode -- comes out of the shared state
 region, so nothing has to be passed alongside the name.
 
